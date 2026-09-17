@@ -296,4 +296,12 @@ or "did the feedback I sent actually land?".
   recent posts, so feed quality is mostly list quality. Cold start on a large
   list takes minutes; the HTTP port opens immediately and serves empty until
   the first refresh lands.
-- **No license file yet** — add one before reusing this as a dependency.
+
+## License
+
+AGPL-3.0-or-later — see [LICENSE](LICENSE).
+
+This program is free software: you can redistribute it and/or modify it under the terms of the
+GNU Affero General Public License as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version. Note the network clause: if you run a
+modified version as a network service, you must offer the corresponding source to its users.
