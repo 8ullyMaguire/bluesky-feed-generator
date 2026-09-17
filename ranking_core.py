@@ -76,8 +76,8 @@ def keyword_score(text, keywords, normal_factor=0.7):
     """Weighted keyword hits.
 
     Hashtag occurrences (#kw) count 1.0 each; plain-text occurrences count
-    `normal_factor` each (0.7 per the 2026-09-14 decision: normal keywords
-    weigh 0.7 vs hashtags). Returns (weighted_score, distinct_keywords_hit).
+    `normal_factor` each (0.7 by default: normal keywords weigh 0.7 against
+    hashtags). Returns (weighted_score, distinct_keywords_hit).
     """
     if not text:
         return 0.0, 0
@@ -95,7 +95,7 @@ def keyword_score(text, keywords, normal_factor=0.7):
 def post_keyword_affinity(weighted_score, saturate_at=4.0):
     """Saturating 0..1 keyword affinity for a single post.
 
-    Unlike the old weighted_ml_affinity() — which divided by the sum of ALL
+    Unlike a naive weighted-keyword count — which divided by the sum of ALL
     known keyword weights and produced ~0.01 for everything — this
     saturates: 4+ weighted hits is as good as it gets.
     """

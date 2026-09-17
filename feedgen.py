@@ -109,7 +109,7 @@ CFG = load_json(os.environ.get("FEEDGEN_CONFIG") or "config.json")
 ENV = load_dotenv(".env") | dict(os.environ)
 
 HOSTNAME = CFG["hostname"]
-SVC_TAG = "feedgen"
+SVC_TAG = CFG.get("svc_tag") or "feedgen"
 SERVICE_DID = f"did:web:{HOSTNAME}"
 PUBLISHER_DID = CFG["publisher_did"]
 FEEDS = {
@@ -265,7 +265,7 @@ CREATE TABLE IF NOT EXISTS interaction_events (
 );
 CREATE INDEX IF NOT EXISTS idx_interaction_post ON interaction_events(post_uri, kind);
 
--- Per-user exclusion state (2026-09-17). Written by the like poller /
+-- Per-user exclusion state. Written by the like poller /
 -- requester-like refresher (user_likes), the sendInteractions handler and
 -- process_interactions (user_hidden), and the not-interested folder
 -- (user_negative_terms). Read on the serve path only — no network I/O.
@@ -389,9 +389,10 @@ def migrate_legacy_state():
             if not os.path.exists(backup):
                 os.replace(LEGACY_STATE_PATH, backup)
     except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
-        print(f"[feedgen] legacy state migration skipped: {e}", flush=True)
+        if not isinstance(e, FileNotFoundError):
+            print(f"[{SVC_TAG}] legacy state migration skipped: {e}", flush=True)
     meta_set("legacy_state_migrated", "1")
-    print(f"[feedgen] migrated {n} legacy seen entries into sqlite", flush=True)
+    print(f"[{SVC_TAG}] migrated {n} legacy seen entries into sqlite", flush=True)
     return n
 
 
@@ -729,12 +730,12 @@ def fetch_all(token):
                 break
             except Exception as e:
                 wait = 2 * (3 ** attempt)          # 2s, 6s, 18s
-                print(f"[feedgen] getListFeed page {page} attempt {attempt + 1} "
+                print(f"[{SVC_TAG}] getListFeed page {page} attempt {attempt + 1} "
                       f"failed: {type(e).__name__}: {str(e)[:120]}", flush=True)
                 if attempt < 2:
                     time.sleep(wait)
         if d is None:
-            print(f"[feedgen] getListFeed page {page} giving up; using "
+            print(f"[{SVC_TAG}] getListFeed page {page} giving up; using "
                   f"{list_items} items collected so far", flush=True)
             break
         items = d.get("feed", [])
@@ -888,10 +889,10 @@ def build_author_priors(min_posts=3):
     return priors, list_median
 
 
-def build_ml_affinity():
-    """Per-author ML affinity from the corpus we already stored.
+def build_topic_affinity():
+    """Per-author topic affinity from the corpus we already stored.
 
-    affinity = share of the author's stored posts that hit an ML keyword.
+    affinity = share of the author's stored posts that hit a topic keyword.
     Config `topic_seeds` (handles or DIDs) are pinned to 1.0.
     """
     keywords = [k.lower() for k in CFG.get("topic_keywords", [])]
@@ -925,6 +926,109 @@ def build_ml_affinity():
     for did in seeds:
         aff[did] = max(aff.get(did, 0.0), 1.0)
     return aff, seeds
+
+
+# --- adaptive keyword weights (optional, config-gated) ----------------------
+# A deployment can let the engine learn how strongly each topic term is
+# actually used in the content its curator engages with. Config terms are
+# seeded from `topic_keywords`; every term carries a weight whose EMA has its
+# fixed point at 1.0 — decay pulls a term below it over time, and an engaged
+# post pulls it back toward 1.0 — so a term the community stops using fades
+# out (down to a per-source floor) and a term it keeps using stays at 1.0.
+# Terms already known can enter the table as source='auto' when the config did
+# not list them, but nothing here invents brand-new terms: discovery is
+# limited to the config plus whatever is already in the table. All of it lives
+# in `keyword_weights`; ranking does NOT read these weights (the topic tilt is
+# computed per post in ranking_core.post_keyword_affinity) — they are a
+# reporting/analysis signal.
+#
+# Everything is off unless the config opts in:
+#   "keyword_weights": {"enabled": true, "half_life_days": 30, ...}
+# A deployment that leaves it out keeps its hands off the table entirely.
+
+KW_DEFAULTS = {"enabled": False, "half_life_days": 30.0, "decay_secs": 3600,
+               "config_floor": 0.5, "auto_floor": 0.1, "hit_ema": 0.3,
+               "max_weight": 2.0, "seed_weight": 1.0, "auto_start": 0.5,
+               "min_weight": 0.2}
+
+
+def kw_cfg():
+    """The keyword-weight knobs, defaults filled in."""
+    merged = dict(KW_DEFAULTS)
+    merged.update(CFG.get("keyword_weights") or {})
+    return merged
+
+
+def kw_enabled():
+    return bool(kw_cfg()["enabled"])
+
+
+def kw_all(con=None):
+    """Known topic terms: the config's plus learned ones above the weight floor."""
+    kws = {k.lower() for k in (CFG.get("topic_keywords") or [])}
+    if con is not None:
+        kws.update(r[0] for r in con.execute(
+            "SELECT keyword FROM keyword_weights WHERE weight > ?",
+            (kw_cfg()["min_weight"],)))
+    return list(kws)
+
+
+def kw_extract(text, known):
+    """Which known terms the text uses. '#term' counts as 'term'."""
+    if not text:
+        return []
+    low = re.sub(r"#(\w+)", r"\1", text.lower())
+    return [kw for kw in known if kw in low]
+
+
+def kw_init():
+    """Seed `keyword_weights` from the config. Idempotent; returns new rows."""
+    if not kw_enabled():
+        return 0
+    n, now = 0, time.time()
+    for kw in (CFG.get("topic_keywords") or []):
+        cur = db().execute(
+            "INSERT OR IGNORE INTO keyword_weights"
+            "(keyword, weight, hits, last_seen, source) VALUES (?,?,0,?,?)",
+            (kw.lower(), kw_cfg()["seed_weight"], now, "config"))
+        n += cur.rowcount
+    return n
+
+
+def kw_update(con, text, now):
+    """Fold one engaged post into the weights. Returns how many terms matched."""
+    if not kw_enabled() or not text:
+        return 0
+    c = kw_cfg()
+    matched = kw_extract(text, kw_all(con))
+    for kw in matched:
+        row = con.execute(
+            "SELECT weight FROM keyword_weights WHERE keyword=?", (kw,)).fetchone()
+        if row:
+            new = min(c["max_weight"], row[0] * (1.0 - c["hit_ema"]) + c["hit_ema"])
+            con.execute("UPDATE keyword_weights SET weight=?, hits=hits+1, "
+                        "last_seen=? WHERE keyword=?", (new, now, kw))
+        else:
+            con.execute("INSERT OR IGNORE INTO keyword_weights"
+                        "(keyword, weight, hits, last_seen, source) VALUES (?,?,1,?,?)",
+                        (kw, c["auto_start"], now, "auto"))
+    return len(matched)
+
+
+def kw_decay(con, now):
+    """Age every weight by the half-life; config terms keep a higher floor."""
+    if not kw_enabled():
+        return 0
+    c = kw_cfg()
+    n = 0
+    for kw, weight, last_seen, source in con.execute(
+            "SELECT keyword, weight, last_seen, source FROM keyword_weights").fetchall():
+        age_days = max(0.0, (now - (last_seen or now)) / 86400.0)
+        floor = c["config_floor"] if source == "config" else c["auto_floor"]
+        con.execute("UPDATE keyword_weights SET weight=? WHERE keyword=?",
+                    (max(floor, weight * 0.5 ** (age_days / c["half_life_days"])), kw))
+        n += 1
+    return n
 
 
 def resolve_pds_host(did):
@@ -989,12 +1093,16 @@ def build_taste(token):
                 did = ((it.get("post") or {}).get("author") or {}).get("did")
                 if did:
                     counts[did] = counts.get(did, 0) + 1
+                    text = ((it.get("post") or {}).get("record")
+                            or {}).get("text", "")
+                    if text:
+                        kw_update(db(), text, time.time())
             cursor = d.get("cursor")
             pages += 1
             if not cursor:
                 break
     except Exception as e:
-        print(f"[feedgen] taste signal unavailable: {e}", flush=True)
+        print(f"[{SVC_TAG}] taste signal unavailable: {e}", flush=True)
         return {}
     if not counts:
         return {}
@@ -1731,7 +1839,7 @@ def poll_interactions():
                    {"identifier": handle, "password": password})
         token = sess["accessJwt"]
     except Exception as e:
-        print(f"[feedgen] affinity poll: auth failed: {e}", flush=True)
+        print(f"[{SVC_TAG}] affinity poll: auth failed: {e}", flush=True)
         return
     appview = CFG["source"]["appview_host"]
 
@@ -1748,7 +1856,7 @@ def poll_interactions():
                     qq = urllib.parse.urlencode({"uri": post_uri, "limit": 100})
                     d = rpc(appview, f"{method}?{qq}", token=token, timeout=30)
                 except Exception as e:
-                    print(f"[feedgen] affinity poll: {method} failed: {e}", flush=True)
+                    print(f"[{SVC_TAG}] affinity poll: {method} failed: {e}", flush=True)
                     break
                 if kind == "like":
                     actors = [l.get("actor", {}).get("did") for l in d.get("likes", [])]
@@ -1768,7 +1876,7 @@ def poll_interactions():
             marked)
     db().commit()
     meta_set("affinity_poll_at", now)
-    print(f"[feedgen] affinity poll: {len(rows)} posts, {len(events)} new events",
+    print(f"[{SVC_TAG}] affinity poll: {len(rows)} posts, {len(events)} new events",
           flush=True)
 
 
@@ -1878,6 +1986,15 @@ def apply_owner_gravity():
 # --------------------------------------------------------------------------
 
 def refresh():
+    # Adaptive keyword weights age continuously: decay them (at most once
+    # an hour) so a term the community stopped using fades out.
+    if kw_enabled():
+        kw_now = time.time()
+        if kw_now - float(meta_get("keyword_decay_at", 0) or 0) > kw_cfg().get("decay_secs", 3600):
+            with DB_LOCK:
+                kw_decay(db(), kw_now)
+            meta_set("keyword_decay_at", kw_now)
+
     src = CFG["source"]
     handle = ENV.get("BSKY_HANDLE")
     password = ENV.get("BSKY_APP_PASSWORD")
@@ -1892,7 +2009,7 @@ def refresh():
     record_posts(posts)
     snapshot_engagements(posts)
 
-    topic_affinity, topic_seeds = build_ml_affinity()
+    topic_affinity, topic_seeds = build_topic_affinity()
     taste = build_taste(token)
     try:
         build_taste_ext()
@@ -1970,14 +2087,14 @@ def refresh_loop():
                                  ("state_uris", "taste_authors", "topic_authors")})
                 CACHE["fetch"] = fstats
             per_feed = " ".join(f"{k}={len(v)}" for k, v in picks.items())
-            print(f"[feedgen] refresh ok: total={sum(len(v) for v in picks.values())} "
+            print(f"[{SVC_TAG}] refresh ok: total={sum(len(v) for v in picks.values())} "
                   f"{per_feed} | scanned={fstats['list_items']} "
                   f"pages={fstats['pages']} owner={fstats['owner_posts']} "
                   f"state={fstats['state_uris']}", flush=True)
         except Exception as e:
             with CACHE_LOCK:
                 CACHE["error"] = f"{type(e).__name__}: {e}"[:300]
-            print(f"[feedgen] refresh failed: {e}", flush=True)
+            print(f"[{SVC_TAG}] refresh failed: {e}", flush=True)
         time.sleep(CFG.get("refresh_secs", 600))
 
 
@@ -2235,8 +2352,10 @@ def warm_start():
 def main():
     migrate_legacy_state()
     migrate_schema()
+    if kw_enabled():
+        print(f"[{SVC_TAG}] keyword weights seeded ({kw_init()} new)", flush=True)
     threading.Thread(target=warm_start, daemon=True).start()
-    print(f"[feedgen] listening on 127.0.0.1:{CFG.get('port', 8080)} "
+    print(f"[{SVC_TAG}] listening on 127.0.0.1:{CFG.get('port', 8080)} "
           f"(warming in the background)", flush=True)
     HTTPServer(("127.0.0.1", CFG.get("port", 8080)), Handler).serve_forever()
 

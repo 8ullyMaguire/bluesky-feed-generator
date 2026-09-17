@@ -679,15 +679,77 @@ def test_less_event_hides_post_and_sinks_author():
 
 
 def test_every_feed_hides_seen_posts():
-    """Owner decision 2026-09-17: per-user seen-hiding on EVERY feed, not just
-    For You. A feed added later without hide_seen would silently go back to
-    repeating posts, so this is the guard, and hide_min_board is the floor that
-    keeps a drained board from serving nothing."""
+    """Per-user seen-hiding on EVERY feed, not just the personal ones: a feed
+    added later without hide_seen would silently go back to repeating posts, so
+    this is the guard, and hide_min_board is the floor that keeps a drained
+    board from serving nothing."""
     missing = [f["rkey"] for f in fg.CFG["feeds"] if not f.get("hide_seen")]
     assert not missing, f"feeds without hide_seen: {missing}"
     assert fg.CFG.get("hide_min_board"), "hide_min_board floor is required"
     print(f"ok   all {len(fg.CFG['feeds'])} feeds declare hide_seen "
           f"(floor={fg.CFG['hide_min_board']})")
+
+
+def test_keyword_weights_learner_is_config_gated():
+    """Adaptive keyword weights: off unless the config opts in, and then the
+    engine seeds `keyword_weights` from `topic_keywords`, learns from engaged
+    posts with an EMA, and decays toward per-source floors. A deployment that
+    leaves the block out must never write the table."""
+    con = fg.db()
+
+    def rows():
+        return {r[0]: (r[1], r[2], r[3]) for r in con.execute(
+            "SELECT keyword, weight, hits, source FROM keyword_weights")}
+
+    old_kws = fg.CFG.get("topic_keywords")
+    old_kw = fg.CFG.get("keyword_weights")
+    try:
+        fg.CFG["topic_keywords"] = ["kwtest-alpha", "kwtest-beta"]
+        with fg.DB_LOCK:
+            con.execute("DELETE FROM keyword_weights")
+        # disabled (the default): the table is never touched
+        fg.CFG["keyword_weights"] = {"enabled": False}
+        fg.kw_init()
+        assert fg.kw_update(con, "a post about kwtest-alpha", time.time()) == 0
+        assert rows() == {}, rows()
+        # enabled: config terms seed at seed_weight with source='config'
+        fg.CFG["keyword_weights"] = {"enabled": True}
+        assert fg.kw_init() == 2, "both config terms seed"
+        assert fg.kw_init() == 0, "seeding is idempotent"
+        weight, hits, source = rows()["kwtest-alpha"]
+        assert (source, hits) == ("config", 0), rows()
+        assert abs(weight - 1.0) < 1e-9, rows()
+        # an engaged post counts a hit and pulls the weight toward the EMA's
+        # fixed point (1.0): a decayed term recovers, a fresh 1.0 stays put
+        now = time.time()
+        assert fg.kw_update(con, "loving #kwtest-alpha today", now) == 1
+        weight1, hits1, _ = rows()["kwtest-alpha"]
+        assert hits1 == 1 and abs(weight1 - 1.0) < 1e-9, rows()
+        with fg.DB_LOCK:
+            con.execute("UPDATE keyword_weights SET weight=0.5 WHERE keyword=?",
+                        ("kwtest-alpha",))
+        fg.kw_update(con, "kwtest-alpha again", now)
+        weight2, hits2, _ = rows()["kwtest-alpha"]
+        assert hits2 == 2 and 0.5 < weight2 <= 1.0, rows()
+        assert fg.kw_update(con, "nothing topical here", now) == 0
+        # decay: 'config' terms floor higher than learned 'auto' ones
+        with fg.DB_LOCK:
+            con.execute("INSERT OR REPLACE INTO keyword_weights"
+                        "(keyword, weight, hits, last_seen, source) VALUES"
+                        "('kwtest-gamma', 0.9, 1, ?, 'auto')", (now - 365 * 86400,))
+        fg.kw_decay(con, now)
+        assert 0.5 <= rows()["kwtest-alpha"][0] <= weight2, rows()
+        assert 0.1 <= rows()["kwtest-gamma"][0] <= 0.9, rows()
+        # known terms = config terms + learned ones above the weight floor
+        known = fg.kw_all(con)
+        assert {"kwtest-alpha", "kwtest-beta"} <= set(known), known
+        assert "kwtest-gamma" not in known, known        # decayed below the floor
+        assert fg.kw_extract("Loving #KWTest-Alpha", ["kwtest-alpha"]) == ["kwtest-alpha"]
+    finally:
+        fg.CFG["topic_keywords"], fg.CFG["keyword_weights"] = old_kws, old_kw
+        with fg.DB_LOCK:
+            con.execute("DELETE FROM keyword_weights")
+    print("ok   keyword weights: config-gated seed, EMA learning, floors, terms")
 
 
 if __name__ == "__main__":
@@ -720,4 +782,5 @@ if __name__ == "__main__":
     test_extract_terms_and_negative_penalty()
     test_less_event_hides_post_and_sinks_author()
     test_every_feed_hides_seen_posts()
+    test_keyword_weights_learner_is_config_gated()
     print("ALL PASS")

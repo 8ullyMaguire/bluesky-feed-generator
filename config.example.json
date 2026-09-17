@@ -3,6 +3,8 @@
 
   "hostname": "feeds.example.com",
   "port": 8080,
+  "svc_tag": "feedgen",
+  "_svc_tag_note": "Log prefix in the journal, so several deployments of this engine on one host stay distinguishable. Defaults to 'feedgen'.",
   "publisher_did": "did:plc:examplepublisher00000000",
   "_publisher_note": "The account that publishes the feed records. Every feed URI is at://<publisher_did>/app.bsky.feed.generator/<rkey> and must be published (publish_feeds.py) before clients can see it.",
   "refresh_secs": 600,
@@ -45,6 +47,20 @@
 
   "topic_seeds": [],
   "_topic_seeds_note": "Optional trusted accounts for the topic tilt, as handles or DIDs. A seed is pinned to affinity 1.0 and its posts get topic_seed_bonus. Useful to bootstrap a topic before the corpus is big enough to infer it.",
+
+  "keyword_weights": {
+    "enabled": false,
+    "half_life_days": 30,
+    "decay_secs": 3600,
+    "hit_ema": 0.3,
+    "max_weight": 2.0,
+    "seed_weight": 1.0,
+    "auto_start": 0.5,
+    "config_floor": 0.5,
+    "auto_floor": 0.1,
+    "min_weight": 0.2
+  },
+  "_keyword_weights_note": "Optional adaptive keyword weights (off by default). When enabled, the engine seeds the keyword_weights table from topic_keywords and then tracks how much each term is actually used in content the curator engages with: each appearance in a liked post pulls the weight toward the EMA fixed point (hit_ema, ceiling max_weight) and every term decays by half_life_days toward a floor (config_floor for config terms, auto_floor for learned ones). Terms the config did not list can only be learned if they are already known, so nothing invents new vocabulary. These weights are a reporting/analysis signal: ranking does not read them (the per-post tilt lives in ranking_core.post_keyword_affinity). Leave the block out and the table is never written.",
 
   "feeds": [
     {

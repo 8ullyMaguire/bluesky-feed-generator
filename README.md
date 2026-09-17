@@ -74,6 +74,7 @@ the feed records — see [Deploying](#deploying).
 | --- | --- |
 | `hostname` | public host; also becomes `did:web:<hostname>` and the service endpoint in `/.well-known/did.json` |
 | `port` | HTTP port (default 8080) |
+| `svc_tag` | log prefix in the journal (default `feedgen`) — how you tell two deployments apart |
 | `publisher_did` | account that owns the published feed records; feed URIs are `at://<publisher_did>/app.bsky.feed.generator/<rkey>` |
 | `refresh_secs` | how often the pool is rescanned (default 600) |
 | `source` | `list_uri` (the curate list), `pds_host`, `appview_host`, `member_page_limit`, `author_feed_limit`, `max_workers`, `include_reposts` |
@@ -82,6 +83,7 @@ the feed records — see [Deploying](#deploying).
 | `blocked_dids` | authors hard-skipped everywhere (never list `owner.did` here) |
 | `topic_keywords` | terms defining this deployment's topic tilt (empty = tilt inert) |
 | `topic_seeds` | trusted handles/DIDs pinned to affinity 1.0 for the tilt |
+| `keyword_weights` | optional adaptive keyword weights (learn from engaged posts, decay over time); off unless `enabled: true`, and a reporting signal only — ranking never reads it |
 | `topic_keyword_weight_factor` | hashtag weight vs plain-text weight for topic terms |
 | `feeds` | the feed list, see below |
 | `tension` | the per-user/curator-taste block, see [Per-user layer](#per-user-layer) |
@@ -171,6 +173,39 @@ and reposts of posts this service served (to attribute interactions to the
 viewers who saw them), refreshing each active viewer's likes on a schedule,
 and hourly engagement snapshots for the trending track.
 
+## Running several deployments from one checkout
+
+The engine is deployment-agnostic, so the same files can serve several
+communities at once — one config, one database, one port each. Two ways to wire
+it, both used in practice:
+
+**Point the service at the shared code** (nothing is copied):
+
+```ini
+[Service]
+WorkingDirectory=/srv/community-a
+ExecStart=/usr/bin/python3 /opt/bluesky-feed-generator/feedgen.py
+Environment=FEEDGEN_CONFIG=/srv/community-a/config.json
+Environment=FEEDGEN_DB=/var/lib/community-a/feeds.sqlite
+```
+
+`FEEDGEN_ENV` has no override: the `.env` with the account credentials is read
+from the directory the *code* lives in, so with this layout the credentials go
+in `/opt/bluesky-feed-generator/.env` — or, cleaner, keep them out of the code
+directory by giving each deployment its own checkout/symlink.
+
+**Symlink the engine into each deployment directory** (what the repository this
+was extracted from does): `ln -s /opt/bluesky-feed-generator/feedgen.py
+/srv/community-a/feedgen.py`. `feedgen.py` resolves its config, `.env` and
+legacy state relative to the path it was *invoked* through (a symlink is not
+resolved), so each deployment keeps its own `config.json`, `.env` and state
+next to the link while the code itself exists exactly once. Give every
+deployment its own `FEEDGEN_DB` — two services must never share one SQLite
+file — and its own `svc_tag` so the journal stays readable.
+
+Either way, the databases stay independent: seen memory, interactions and
+affinity are per-deployment by construction.
+
 ## Deploying
 
 1. **Serve it.** Run `python3 feedgen.py` under a service manager. It binds
@@ -219,11 +254,12 @@ per test and exits non-zero on failure.
 
 ```sh
 python3 test_ranking_core.py         # pure ranking math
-python3 test_ranking.py feedgen.py   # ranking, gates, dedup, per-user layer, JWT
+python3 test_ranking.py feedgen.py   # ranking, gates, dedup, per-user layer, JWT,
+                                     # keyword weights
 python3 test_feedgen_auth.py         # authenticated getFeedSkeleton path
 ```
 
-They run against a throwaway SQLite file and (unless a local `config.json`
+42 checks in total. They run against a throwaway SQLite file and (unless a local `config.json`
 exists) the example config, so a fresh clone is green. One auth test performs a
 single outbound request for a non-existent DID to exercise the cold-start path;
 if it fails, it degrades gracefully and the test still passes.
