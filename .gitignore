@@ -1,0 +1,8 @@
+# Local, never published
+config.json
+.env
+__pycache__/
+*.bak*
+feedgen-state.json*
+*.sqlite*
+actions-report.md
