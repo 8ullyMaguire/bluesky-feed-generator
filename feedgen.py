@@ -1063,7 +1063,8 @@ def resolve_pds_host(did):
 def build_taste(token):
     """Owner's own likes -> affinity toward the authors they actually like.
 
-    This is the "learns from your tastes" half of the ML feeds. It reads only
+    This is the "learns from your tastes" half of the topic-tilted feeds. It
+    reads only
     the owner's own public likes. NOTE: `app.bsky.feed.getActorLikes` is served
     by the PDS (bsky.social) with auth; public.api.bsky.app answers
     "Profile not found" for it.

@@ -78,7 +78,7 @@ def test_rank_score_taste_multiplier_on_any_mode():
 
 
 def test_rank_score_hashtag_beats_plain():
-    fcfg = {"ranking": "ml", "topic_weight": 2.5, "topic_keyword_bonus": 0.35,
+    fcfg = {"ranking": "topic", "topic_weight": 2.5, "topic_keyword_bonus": 0.35,
             "decay_factor": 0.6}
     ctx = dict(CTX, topic_keywords=[KW0])
     s_tag = fg.rank_score(post(text=f"#{KW0}"), fcfg, W, 1.0, ctx)
