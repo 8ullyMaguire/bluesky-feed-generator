@@ -10,7 +10,9 @@ Endpoints (hostname/port from the config):
   /xrpc/app.bsky.feed.describeFeedGenerator
   /xrpc/app.bsky.feed.getFeedSkeleton?feed=<feed-uri>&limit=&cursor=
   /xrpc/app.bsky.feed.sendInteractions   (per-user "show less" / feedback)
-  /  and  /health  (human status page for all feeds, with per-feed counts)
+  /                public page: what each feed of this deployment is for
+  /status, /health operator page (per-feed counts and pipeline counters, no numbers
+                   on the public page: see the "public page" section below)
 
 DESIGN NOTES
 ------------
@@ -61,6 +63,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import base64
+import html
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -2100,6 +2103,277 @@ def refresh_loop():
 
 
 # --------------------------------------------------------------------------
+# public page  (what this deployment serves, and what each feed does)
+# --------------------------------------------------------------------------
+# The page is deliberately GENERIC. It explains each feed in prose and reads
+# no numbers out of the config: no thresholds, no ranking mode names, no
+# window lengths, no dedup TTLs, no board sizes, no scoring weights. Two
+# reasons:
+#   * the knobs are the anti-gaming settings of a live feed;
+#   * anything derived from them drifts the moment one changes -- the
+#     published descriptions claimed "one third of likers must repost" for
+#     weeks after the gate was relaxed to 5-10%.
+#
+# Text comes from exactly three places, and nothing else:
+#   * CFG["page"]                     -- deployment-wide copy
+#   * CFG["feeds"][i]["page"]         -- one feed's tagline / "use it when"
+#   * CFG["feeds"][i]["description"]  -- fallback tagline when no page block
+# plus CFG["owner"]["handle"], used only to build the bsky.app feed links.
+# --------------------------------------------------------------------------
+
+DEFAULT_HOW = [
+    "One hand-maintained list of accounts is the whole pool: only posts by those accounts are eligible.",
+    "A post counts for its likes, reposts, quotes and replies; reposts and quotes weigh more than likes.",
+    "Each feed has its own character: some look at the last few hours, others months back, and each "
+    "filters out noise with its own bars.",
+    "The order is recalculated continuously, and what you already saw is not repeated back to you: "
+    "the feeds learn from you, not only from the list.",
+]
+
+PAGE_DEFAULTS = {
+    "lang": "en",
+    "title": None,                  # None -> "<svc_tag> feeds"
+    "tagline": "",
+    "how_title": "How these feeds work",
+    "how": DEFAULT_HOW,
+    "feeds_title": "The feeds, one by one",
+    "faq_title": "Questions",
+    "faq": [],
+    "community_title": "Other community feeds",
+    "community_feeds": [],
+    "labels": {
+        "use_when": "Use it when",
+        "open": "Open in Bluesky",
+        "status_link": "Service status",
+        "repo_link": "Source code",
+        "github_link": "GitHub",
+        "star_link": "Star on GitHub",
+        "note": "These are independent third-party custom feeds. "
+                "Bluesky does not operate or endorse them.",
+    },
+    "show_descriptions": True,
+    "credits": "",
+    "repo": "",
+    "github": "",                   # "" -> no GitHub icon in the footer
+    "github_star": True,            # the footer icon asks for a star, not just a visit
+}
+
+# Official GitHub mark (16x16), inline so the page needs no external asset and
+# no network round-trip to render.
+GITHUB_ICON = (
+    '<svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true" focusable="false" '
+    'fill="currentColor"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 '
+    '6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94'
+    '-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 '
+    '1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82'
+    '-2.15-.07-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c'
+    '1.53-1.04 2.2-.82 2.2-.82.44 1.1.15 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 '
+    '3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 '
+    '8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>'
+)
+
+PAGE_CSS = """
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 2rem 1rem 4rem; background: Canvas; color: CanvasText;
+       font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+main { max-width: 46rem; margin: 0 auto; }
+h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 .6rem; }
+h2 { font-size: 1.25rem; margin: 2.4rem 0 .8rem; padding-bottom: .3rem;
+     border-bottom: 1px solid rgba(127,127,127,.35); }
+h3 { font-size: 1.05rem; margin: 0 0 .35rem; }
+.lede { font-size: 1.05rem; margin: 0 0 1rem; }
+.how { padding-left: 1.2rem; }
+.how li { margin: .3rem 0; }
+.feeds { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr)); }
+.feed { border: 1px solid rgba(127,127,127,.35); border-radius: .6rem; padding: .9rem 1rem; }
+.tagline { margin: 0 0 .5rem; }
+.use { font-size: .92rem; margin: .3rem 0 .6rem; }
+.desc { font-size: .85rem; opacity: .78; margin: .3rem 0; }
+.open { margin: .4rem 0 0; }
+.faq details { border-top: 1px solid rgba(127,127,127,.2); padding: .6rem 0; }
+.faq summary { cursor: pointer; font-weight: 600; }
+.faq p { margin: .4rem 0 0; }
+.community { padding-left: 1.2rem; }
+footer { margin-top: 3rem; font-size: .85rem; opacity: .85; }
+footer .note { opacity: .7; }
+a.gh { display: inline-flex; align-items: center; gap: .4rem; padding: .35rem .7rem;
+       border: 1px solid rgba(127,127,127,.45); border-radius: .45rem;
+       text-decoration: none; color: inherit; font-weight: 600; }
+a.gh:hover { border-color: rgba(127,127,127,.8); }
+a.gh .star { font-size: 1.05em; }
+"""
+
+
+def page_cfg(cfg):
+    """This deployment's page copy, with the engine defaults filled in."""
+    given = cfg.get("page") or {}
+    out = dict(PAGE_DEFAULTS)
+    for k, v in given.items():
+        if k != "labels":
+            out[k] = v
+    out["labels"] = dict(PAGE_DEFAULTS["labels"])
+    out["labels"].update(given.get("labels") or {})
+    if not out.get("title"):
+        out["title"] = f"{SVC_TAG} feeds"
+    return out
+
+
+def feed_open_url(cfg, rkey):
+    """The bsky.app link that opens this feed in the Bluesky app."""
+    handle = ((cfg.get("owner") or {}).get("handle") or "").lstrip("@")
+    return f"https://bsky.app/profile/{handle}/feed/{rkey}"
+
+
+def render_feed_card(cfg, f):
+    """One feed: its name, its curated tagline, when to use it, and the link."""
+    e = html.escape
+    page = page_cfg(cfg)
+    labels = page["labels"]
+    fpage = f.get("page") or {}
+    rkey = f["rkey"]
+    tagline = fpage.get("tagline") or f.get("description") or ""
+    parts = [f'<article class="feed" id="{e(rkey)}">',
+             f'<h3>{e(f.get("display_name") or rkey)}</h3>',
+             f'<p class="tagline">{e(tagline)}</p>']
+    if fpage.get("use_when"):
+        parts.append(f'<p class="use"><b>{e(labels["use_when"])}:</b> '
+                     f'{e(fpage["use_when"])}</p>')
+    if page["show_descriptions"] and f.get("description") and f["description"] != tagline:
+        parts.append(f'<p class="desc">{e(f["description"])}</p>')
+    parts.append(f'<p class="open"><a href="{e(feed_open_url(cfg, rkey))}">'
+                 f'{e(labels["open"])} &rarr;</a></p>')
+    parts.append("</article>")
+    return "".join(parts)
+
+
+def render_index_page(cfg):
+    """The public page at "/": what this deployment serves, and what each feed is for."""
+    e = html.escape
+    page = page_cfg(cfg)
+    labels = page["labels"]
+    handle = ((cfg.get("owner") or {}).get("handle") or "").lstrip("@")
+    cards = "".join(render_feed_card(cfg, f) for f in cfg.get("feeds", []))
+    faq = "".join(f'<details><summary>{e(i.get("q", ""))}</summary>'
+                  f'<p>{e(i.get("a", ""))}</p></details>'
+                  for i in page["faq"])
+    community = ""
+    if page["community_feeds"]:
+        items = "".join(
+            f'<li><a href="https://bsky.app/profile/{e(c.get("handle", ""))}'
+            f'/feed/{e(c.get("rkey", ""))}">'
+            f'{e(c.get("name") or c.get("handle", ""))}</a></li>'
+            for c in page["community_feeds"])
+        community = (f'<section><h2>{e(page["community_title"])}</h2>'
+                     f'<ul class="community">{items}</ul></section>')
+    footer = []
+    if page["github"]:
+        # An icon alone asks for nothing; the request is the point.
+        star = f'<span class="star" aria-hidden="true">&#9733;</span>' if page["github_star"] else ""
+        footer.append(
+            f'<p><a class="gh" href="{e(page["github"])}" rel="noopener" '
+            f'target="_blank" title="{e(labels["star_link"])}">{GITHUB_ICON}'
+            f'<span>{e(labels["star_link"])}</span>{star}</a></p>')
+    if page["credits"]:
+        footer.append(f'<p>{e(page["credits"])}</p>')
+    links = []
+    if page["repo"]:
+        links.append(f'<a href="{e(page["repo"])}">{e(labels["repo_link"])}</a>')
+    links.append(f'<a href="/status">{e(labels["status_link"])}</a>')
+    footer.append("<p>" + " · ".join(links) + "</p>")
+    footer.append(f'<p class="note">{e(labels["note"])}</p>')
+    doc = f"""<!doctype html>
+<html lang="{e(page["lang"])}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{e(page["title"])}</title>
+<style>{PAGE_CSS}</style>
+</head>
+<body>
+<main>
+<h1>{e(page["title"])}</h1>
+<p class="lede">{e(page["tagline"])}</p>
+<p class="cta"><a href="https://bsky.app/profile/{e(handle)}">@{e(handle)} on Bluesky &rarr;</a></p>
+<h2>{e(page["how_title"])}</h2>
+<ol class="how">{"".join(f"<li>{e(s)}</li>" for s in page["how"])}</ol>
+<h2>{e(page["feeds_title"])}</h2>
+<div class="feeds">{cards}</div>
+{community}
+<h2>{e(page["faq_title"])}</h2>
+<section class="faq">{faq}</section>
+<footer>
+{"".join(footer)}
+</footer>
+</main>
+</body>
+</html>"""
+    return doc.encode()
+
+
+def render_status_page(snap, cfg):
+    """The operator view (also /health): board sizes, gate counts, last refresh.
+
+    This is the page that lived at "/" before the reader-facing page took that
+    path over. It is the diagnosis surface the vault depends on; keep its shape.
+    """
+    rows = "".join(
+        f"<li><code>{f['rkey']}</code> ({f['display_name']}): "
+        f"<b>{snap['feeds'].get(f['rkey'], 0)}</b> posts</li>"
+        for f in cfg["feeds"])
+    stat_rows = "".join(
+        "<tr><td>{rk}</td><td>{in_window}</td><td>{pass_share}</td>"
+        "<td>{pass_gates}</td><td>{suppressed}</td><td>{owner}</td>"
+        "<td>{final}</td><td>{ttl}h</td></tr>".format(rk=k, **v)
+        for k, v in snap["stats"].items())
+    fetch = snap.get("fetch", {})
+    try:
+        pstats = db().execute(
+            "SELECT (SELECT COUNT(DISTINCT requester_did) FROM served_posts), "
+            "(SELECT COUNT(*) FROM interaction_events), "
+            "(SELECT COUNT(*) FROM user_affinity)").fetchone()
+    except sqlite3.Error:
+        pstats = (0, 0, 0)
+    mrows = ""
+    try:
+        for rk, n, ua, ma, sm, sp in db().execute(
+                "SELECT feed_rkey, posts, unique_authors, "
+                "median_age_hours, score_median, score_p90 FROM "
+                "metrics_log WHERE ts=(SELECT MAX(ts) FROM metrics_log)"):
+            mrows += (f"<tr><td>{rk}</td><td>{n}</td><td>{ua}</td>"
+                      f"<td>{ma}</td><td>{sm}</td><td>{sp}</td></tr>")
+    except sqlite3.Error:
+        pass
+    metrics_html = (f"<h2>metrics (latest refresh)</h2><table border=1>"
+                    f"<tr><th>feed</th><th>posts</th><th>unique authors</th>"
+                    f"<th>median age h</th><th>score median</th>"
+                    f"<th>score p90</th></tr>{mrows}</table>")
+    out = (
+        f"{metrics_html}"
+        f"<h1>Top-posts feeds</h1><ul>{rows}</ul>"
+        f"<h2>per-feed pipeline</h2>"
+        f"<table border=1 cellpadding=4><tr><th>feed</th><th>in_window</th>"
+        f"<th>pass_share</th><th>pass_gates</th><th>suppressed</th>"
+        f"<th>owner</th><th>final</th><th>ttl</th></tr>{stat_rows}</table>"
+        f"<p>scanned={snap['scanned']} list_items={fetch.get('list_items','?')} "
+        f"pages={fetch.get('pages','?')} owner_posts={fetch.get('owner_posts','?')} "
+        f"updated={snap['updated']:.0f} gen={snap.get('gen','?')} "
+        f"error={snap['error']}</p>"
+        f"<p>state_rows={snap.get('state_uris','?')} "
+        f"topic_authors={snap.get('topic_authors','?')} "
+        f"taste_authors={snap.get('taste_authors','?')} "
+        f"db={os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0} bytes</p>"
+        f"<p>personalization: requesters={pstats[0]} events={pstats[1]} "
+        f"affinity_rows={pstats[2]}</p>"
+        f"<p>hide: " + " ".join(
+            f"{rk}=excl{h.get('excluded', 0)}/board{h.get('board', 0)}"
+            for rk, h in sorted((snap.get("hide_stats") or {}).items()))
+        + "</p>"
+    )
+    return out.encode()
+
+
+# --------------------------------------------------------------------------
 # http
 # --------------------------------------------------------------------------
 
@@ -2213,65 +2487,15 @@ class Handler(BaseHTTPRequestHandler):
                 "Cache-Control": "no-store, no-cache, must-revalidate",
                 "Pragma": "no-cache"})
 
-        if u.path in ("/", "/health"):
+        if u.path == "/":
+            return self._send(200, render_index_page(CFG), "text/html")
+
+        if u.path in ("/health", "/status"):
             with CACHE_LOCK:
                 snap = {k: v for k, v in CACHE.items()}
                 snap["feeds"] = {rk: len(v) for rk, v in CACHE["feeds"].items()}
                 snap["stats"] = {k: dict(v) for k, v in CACHE["stats"].items()}
-            rows = "".join(
-                f"<li><code>{f['rkey']}</code> ({f['display_name']}): "
-                f"<b>{snap['feeds'].get(f['rkey'], 0)}</b> posts</li>"
-                for f in CFG["feeds"])
-            stat_rows = "".join(
-                "<tr><td>{rk}</td><td>{in_window}</td><td>{pass_share}</td>"
-                "<td>{pass_gates}</td><td>{suppressed}</td><td>{owner}</td>"
-                "<td>{final}</td><td>{ttl}h</td></tr>".format(rk=k, **v)
-                for k, v in snap["stats"].items())
-            fetch = snap.get("fetch", {})
-            try:
-                pstats = db().execute(
-                    "SELECT (SELECT COUNT(DISTINCT requester_did) FROM served_posts), "
-                    "(SELECT COUNT(*) FROM interaction_events), "
-                    "(SELECT COUNT(*) FROM user_affinity)").fetchone()
-            except sqlite3.Error:
-                pstats = (0, 0, 0)
-            mrows = ""
-            try:
-                for rk, n, ua, ma, sm, sp in db().execute(
-                        "SELECT feed_rkey, posts, unique_authors, "
-                        "median_age_hours, score_median, score_p90 FROM "
-                        "metrics_log WHERE ts=(SELECT MAX(ts) FROM metrics_log)"):
-                    mrows += (f"<tr><td>{rk}</td><td>{n}</td><td>{ua}</td>"
-                              f"<td>{ma}</td><td>{sm}</td><td>{sp}</td></tr>")
-            except sqlite3.Error:
-                pass
-            metrics_html = (f"<h2>metrics (latest refresh)</h2><table border=1>"
-                            f"<tr><th>feed</th><th>posts</th><th>unique authors</th>"
-                            f"<th>median age h</th><th>score median</th>"
-                            f"<th>score p90</th></tr>{mrows}</table>")
-            html = (
-                f"{metrics_html}"
-                f"<h1>Top-posts feeds</h1><ul>{rows}</ul>"
-                f"<h2>per-feed pipeline</h2>"
-                f"<table border=1 cellpadding=4><tr><th>feed</th><th>in_window</th>"
-                f"<th>pass_share</th><th>pass_gates</th><th>suppressed</th>"
-                f"<th>owner</th><th>final</th><th>ttl</th></tr>{stat_rows}</table>"
-                f"<p>scanned={snap['scanned']} list_items={fetch.get('list_items','?')} "
-                f"pages={fetch.get('pages','?')} owner_posts={fetch.get('owner_posts','?')} "
-                f"updated={snap['updated']:.0f} gen={snap.get('gen','?')} "
-                f"error={snap['error']}</p>"
-                f"<p>state_rows={snap.get('state_uris','?')} "
-                f"topic_authors={snap.get('topic_authors','?')} "
-                f"taste_authors={snap.get('taste_authors','?')} "
-                f"db={os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0} bytes</p>"
-                f"<p>personalization: requesters={pstats[0]} events={pstats[1]} "
-                f"affinity_rows={pstats[2]}</p>"
-                f"<p>hide: " + " ".join(
-                    f"{rk}=excl{h.get('excluded', 0)}/board{h.get('board', 0)}"
-                    for rk, h in sorted((snap.get("hide_stats") or {}).items()))
-                + "</p>"
-            ).encode()
-            return self._send(200, html, "text/html")
+            return self._send(200, render_status_page(snap, CFG), "text/html")
 
         return self._send(404, {"error": "NotFound"})
 
