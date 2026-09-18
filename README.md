@@ -19,6 +19,13 @@ curate list ──► posts table ──► ranking (per feed) ──► per-use
 
 - **Many feeds from one pool.** Each feed is a config entry: its own age
   window, engagement gates, ranking mode, dedup window and size limits.
+- **A reader-facing page at `/`.** Every feed of a deployment is described there:
+  what it is for, when to use it, an open-in-Bluesky link, a deployment FAQ and a
+  "star on GitHub" link. Copy lives in `config.json` (`page` at the top level,
+  `page` per feed) and is deliberately generic — no threshold, ranking mode,
+  window, TTL or board size is ever published, so the page cannot advertise a
+  rule the ranker does not apply. The operator view (board sizes, gate counts,
+  cache state) moved to `/status` and `/health`.
 - **Five ranking modes** — see [Ranking modes](#ranking-modes). A time-decayed
   velocity ranking (Hacker-News style), a two-track *trending* builder that
   mixes fresh posts with posts being rediscovered right now, a topic tilt, and
@@ -90,6 +97,7 @@ the feed records — see [Deploying](#deploying).
 | `hide_min_board` | anti-starvation floor: per-user hiding never shrinks a board below this many posts (default 20) |
 | `hide_seen_ttl_h` | how long a served post stays hidden from that viewer, across every feed of this deployment (default 24) |
 | `snapshot_interval_hours` / `snapshot_prune_hours` | engagement-snapshot cadence and retention |
+| `page` | copy for the public page at `/`: `lang`, `title`, `tagline`, `how[]`, `faq[]{q,a}`, `community_feeds[]{name,handle,rkey}`, `labels{}` (button and heading strings), `show_descriptions`, `credits`, `repo`, `github` (repo URL; renders a "star on GitHub" link). All optional — anything missing falls back to English engine defaults. Keep it generic: this text is public, so it must not restate the knobs above |
 
 Every deployment of this code is independent: separate config, separate
 SQLite file, separate `serverInteractions` state. Running two of them (say, two
@@ -114,6 +122,7 @@ never mix.
 | `topic_weight`, `topic_keyword_bonus`, `topic_seed_bonus`, `keyword_saturate` | topic-tilt knobs |
 | `hide_seen`, `seen_ttl_hours` | opt this feed into per-viewer dedup, and for how long |
 | `window_hours`, `half_life_hours`, `vintage_slot_fraction`, `vintage_min_age_hours`, `vintage_max_age_hours` | `trending` only: the fresh track's velocity window and the rediscovery track's age band and slot share |
+| `page` | optional `{tagline, use_when}` shown on the public page for this feed; without it the published `description` is used as the tagline |
 
 ## Ranking modes
 
@@ -239,8 +248,10 @@ affinity are per-deployment by construction.
    python3 publish_feeds.py
    ```
 
-3. **Check it.** `GET /health` (or `/`) renders the per-feed status page:
-   board size, cache generation, gate counts, last refresh.
+3. **Check it.** `GET /` is the public page: what each feed of this deployment is
+   for, with an open-in-Bluesky link each. `GET /status` (and `GET /health`)
+   renders the operator page: board size, cache generation, gate counts, last
+   refresh.
 
 Environment variables: `FEEDGEN_CONFIG` (config path, default
 `./config.json`), `FEEDGEN_DB` (SQLite path, default
@@ -257,9 +268,11 @@ python3 test_ranking_core.py         # pure ranking math
 python3 test_ranking.py feedgen.py   # ranking, gates, dedup, per-user layer, JWT,
                                      # keyword weights
 python3 test_feedgen_auth.py         # authenticated getFeedSkeleton path
+python3 test_page.py                 # public page: no config value on it, escaping,
+                                     # routes, feed API regression
 ```
 
-42 checks in total. They run against a throwaway SQLite file and (unless a local `config.json`
+56 checks in total. They run against a throwaway SQLite file and (unless a local `config.json`
 exists) the example config, so a fresh clone is green. One auth test performs a
 single outbound request for a non-existent DID to exercise the cold-start path;
 if it fails, it degrades gracefully and the test still passes.

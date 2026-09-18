@@ -217,6 +217,36 @@
     }
   ],
 
+  "page": {
+    "_note": "Copy for the public page served at '/'. All keys optional; anything missing falls back to English engine defaults. This text is PUBLIC and must stay generic: never restate a threshold, ranking mode, window, TTL, board size or scoring weight from the config above — those are the anti-gaming knobs, and numbers in public copy drift the moment a knob changes.",
+    "lang": "en",
+    "title": "Example community feeds",
+    "tagline": "Several hand-built feeds built from one curate list, ranked by our own rules rather than an opaque algorithm's.",
+    "how": [
+      "One hand-maintained list of accounts is the whole pool: only posts by those accounts are eligible.",
+      "A post counts for its likes, reposts, quotes and replies; reposts and quotes weigh more than likes.",
+      "Each feed has its own character: some look at the last few hours, others months back.",
+      "The order is recalculated continuously, and what you already saw is not repeated back to you."
+    ],
+    "faq": [
+      {"q": "Why do I see posts with no likes?", "a": "Posts by the account that runs these feeds always appear, without a bar. Everything else has to clear the feed's own minimum."},
+      {"q": "Is this open source?", "a": "The engine is AGPL-3.0 and linked below."}
+    ],
+    "community_feeds": [],
+    "labels": {
+      "use_when": "Use it when",
+      "open": "Open in Bluesky",
+      "status_link": "Service status",
+      "repo_link": "Source code",
+      "star_link": "Star on GitHub",
+      "note": "These are independent third-party custom feeds. Bluesky does not operate or endorse them."
+    },
+    "show_descriptions": false,
+    "credits": "Maintained by the example community.",
+    "repo": "https://example.test/feed-generator",
+    "github": "https://github.com/example/feed-generator"
+  },
+
   "tension": {
     "_note": "Curator-taste tension and the per-user learning layer. `taste_weight` on each feed is how much the curator's taste shapes the shared baseline; `personal_feeds` get serve-time per-user re-ranking plus exploration slots (`explore_share` of the page is woven from curator-taste authors the requester has no signal for yet); `owner_gravity_daily` drifts a user's affinity toward curator taste (0.004/day ~ 30% convergence after 90 days for never-touched authors, while fresh interactions re-assert the user's own shape); `taste_sources` are extra accounts whose likes contribute to the taste baseline; the poll_*/likes_refresh_* budgets cap the background AppView polling that attributes likes and reposts to the requesters we served.",
     "personal_feeds": [
