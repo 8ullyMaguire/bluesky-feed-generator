@@ -123,6 +123,49 @@ def test_index_has_cta_quiz_link_and_limits_sentence():
     print("ok   / shows the CTA, a /quiz link, /stats, and the blocks/mutes limit")
 
 
+def test_taste_lists_each_author_exactly_once():
+    """A one-row-per-author guarantee.
+
+    This regressed for real: a LEFT JOIN to posts returned one row per stored
+    POST, so five affinity rows rendered as twenty-five rows all showing the
+    same handle -- the reader would conclude the quiz counted one choice five
+    times. An author with several stored posts is the normal case, so the
+    fixture creates several on purpose.
+    """
+    _seed_posts()
+    vkey = "e" * 32
+    now = time.time()
+    # Five affinity rows for FIVE different authors, and the FIRST author gets
+    # many stored posts. One post per author cannot reproduce the bug at all --
+    # a one-to-many relation only duplicates when the "many" side has >1 row.
+    # Real authors here hold hundreds to thousands of posts.
+    authors = [f"did:plc:quizauthor{i:03d}" for i in range(5)]
+    with fg.DB_LOCK:
+        fg.db().executemany(
+            "INSERT OR REPLACE INTO posts(uri,cid,author_did,author_handle,"
+            "indexed_at,like_count,repost_count,quote_count,reply_count,text,"
+            "langs,record_json,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(f"at://{authors[0]}/app.bsky.feed.post/many{j}", f"c{j}",
+              authors[0], "manyposts.test", "2026-09-28T00:00:00.000Z",
+              1, 0, 0, 0, f"post {j}", "", "{}", now, now)
+             for j in range(12)])
+        fg.db().executemany(
+            "INSERT OR REPLACE INTO visitor_affinity(visitor_key, author_did, "
+            "score, updated_at) VALUES(?,?,?,?)",
+            [(vkey, a, 0.6, now) for a in authors])
+        fg.db().commit()
+    html = _html(fg.render_taste_page(fg.CFG, None, vkey))
+    rows = re.findall(r"<tr><td>@?([^<]*)</td><td>([-0-9.]+)</td></tr>", html)
+    # The negative-terms table is the second one on the page and its values are
+    # hit counts (integers); the affinity table holds signed scores. Filter on
+    # the SIGN, which is what distinguishes them, or this test silently stops
+    # checking anything.
+    aff = [r for r in rows if r[1].startswith("-") or float(r[1]) not in (1.0, 0.0)]
+    assert len(aff) == 5, f"expected 5 author rows, got {len(aff)}: {aff}"
+    assert len({r[0] for r in aff}) == 5, f"handles repeated: {aff}"
+    print("ok   /taste lists each author once, even with many stored posts")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

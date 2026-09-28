@@ -2470,8 +2470,10 @@ def render_taste_page(cfg, did, vkey):
     e = html.escape
     if did:
         aff = db().execute(
-            "SELECT a.author_did, a.score, p.author_handle FROM user_affinity a "
-            "LEFT JOIN posts p ON p.author_did = a.author_did "
+            "SELECT a.author_did, a.score, "
+            "(SELECT author_handle FROM posts WHERE author_did = a.author_did "
+            " AND author_handle IS NOT NULL AND author_handle != '' LIMIT 1) "
+            "FROM user_affinity a "
             "WHERE a.requester_did=? ORDER BY ABS(a.score) DESC LIMIT 25",
             (did,)).fetchall()
         neg = db().execute(
@@ -2483,8 +2485,10 @@ def render_taste_page(cfg, did, vkey):
         who = f"tu sesion ({e(did[:22])})"
     elif vkey:
         aff = db().execute(
-            "SELECT a.author_did, a.score, p.author_handle FROM visitor_affinity a "
-            "LEFT JOIN posts p ON p.author_did = a.author_did "
+            "SELECT a.author_did, a.score, "
+            "(SELECT author_handle FROM posts WHERE author_did = a.author_did "
+            " AND author_handle IS NOT NULL AND author_handle != '' LIMIT 1) "
+            "FROM visitor_affinity a "
             "WHERE a.visitor_key=? ORDER BY ABS(a.score) DESC LIMIT 25",
             (vkey,)).fetchall()
         neg = db().execute(
