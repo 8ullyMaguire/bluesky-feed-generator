@@ -53,6 +53,7 @@ of rewriting a JSON file on every pick. `feedgen-state.json` is migrated once
 on first start and kept as a backup.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -74,6 +75,15 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.exceptions import InvalidSignature
 
 import ranking_core
+
+# /also-liked fan-out budgets. A public endpoint that reaches out to 20
+# accounts is a load multiplier on one box behind a tunnel; these caps ARE the
+# safety property. Do not raise them for better results.
+ALSO_LIKED_MAX_LIKERS = 20
+ALSO_LIKED_MAX_LISTRECORDS_CALLS = 40
+ALSO_LIKED_MAX_CANDIDATE_URIS = 200
+ALSO_LIKED_MAX_LIMIT = 40
+ALSO_LIKED_CACHE_TTL = 1800
 
 # Discovery helpers (pure functions behind /why, /also-liked and /people).
 # Optional: a missing file must not stop the service from serving feeds, so the
@@ -554,7 +564,7 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
     gate_mode = fcfg.get("gate_mode", "all")
     stats = {"in_window": 0, "pass_share": 0, "pass_gates": 0,
              "suppressed": 0, "final": 0, "owner": 0,
-             "vintage_cands": 0, "vintage_picked": 0}
+             "vintage_cands": 0, "vintage_picked": 0, "over_max_likes": 0}
     ranking_mode = fcfg.get("ranking", "flat")
     vfrac = fcfg.get("vintage_slot_fraction", 0.0) or 0.0
     v_min = fcfg.get("vintage_min_age_hours", 6)
@@ -608,6 +618,13 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
                 min_share = max_share_gate
             
             if min_share and (likes <= 0 or reposts < likes * min_share):
+                continue
+            # The small-accounts feed's whole point is an UPPER bound: keep
+            # posts from accounts nobody amplified. Applied after the share
+            # gate and before scoring, so a filtered post never costs work.
+            max_likes = fcfg.get("max_likes") or 0
+            if max_likes and likes > int(max_likes):
+                stats["over_max_likes"] = stats.get("over_max_likes", 0) + 1
                 continue
             stats["pass_share"] += 1
             uri = p.get("uri")
@@ -2628,6 +2645,95 @@ class Handler(BaseHTTPRequestHandler):
             payload["summary"] = discovery.summarize(
                 brk, rank, aff is not None, terms)
             return self._send(200, payload)
+
+        if u.path == "/also-liked":
+            if discovery is None:
+                return self._send(503, {"ok": False, "reason": "discovery module unavailable"})
+            post_uri = (q.get("post") or [""])[0].strip()
+            try:
+                limit = max(1, min(ALSO_LIKED_MAX_LIMIT,
+                                   int((q.get("limit") or ["20"])[0] or 20)))
+            except ValueError:
+                limit = 20
+            if not post_uri:
+                return self._send(400, {"ok": False, "reason": "post required"})
+            # Cache first: a repeat visit inside the TTL is free, and the TTL
+            # is what keeps a scrape from turning into upstream amplification.
+            ckey = f"al:{hashlib.sha256(post_uri.encode()).hexdigest()[:16]}:{SVC_TAG}"
+            cached = meta_get(ckey)
+            if cached:
+                ts, _, blob = cached.partition("|")
+                try:
+                    if (time.time() - float(ts)) < ALSO_LIKED_CACHE_TTL:
+                        payload = json.loads(blob)
+                        payload["cache"] = "hit"
+                        return self._send(200, payload)
+                except (ValueError, TypeError):
+                    pass
+            av = CFG.get("source", {}).get("appview_host", "https://public.api.bsky.app")
+            # Who liked this post. Public, no auth, one call.
+            try:
+                d = rpc(av, "app.bsky.feed.getLikes?" + urllib.parse.urlencode(
+                    {"uri": post_uri, "limit": ALSO_LIKED_MAX_LIKERS}))
+                likers = [r.get("actor") for r in (d.get("likes") or []) if r.get("actor")]
+            except Exception as e:                          # noqa: BLE001
+                print(f"[{SVC_TAG}] also-liked getLikes failed: {e}", flush=True)
+                likers = []
+            likers = likers[:ALSO_LIKED_MAX_LIKERS]
+            out = {"ok": True, "post": post_uri, "likers_examined": len(likers),
+                   "candidates": [], "cache": "miss"}
+            if not likers:
+                meta_set(ckey, f"{time.time()}|{json.dumps(out)}")
+                return self._send(200, out)
+            # What those accounts liked. Bounded twice: a hard call counter AND
+            # a cap on collected URIs, so the fan-out cannot run away even if
+            # every liker returns a full page.
+            uris, seen = [], set()
+            calls = 0
+            for who in likers:
+                if calls >= ALSO_LIKED_MAX_LISTRECORDS_CALLS:
+                    break
+                if len(uris) >= ALSO_LIKED_MAX_CANDIDATE_URIS:
+                    break
+                calls += 1
+                try:
+                    host = resolve_pds_host(who)
+                    d = rpc(host, "com.atproto.repo.listRecords?" + urllib.parse.urlencode(
+                        {"repo": who, "collection": "app.bsky.feed.like", "limit": 100}))
+                except Exception:                          # noqa: BLE001
+                    continue        # one dead account must not fail the request
+                for rec in (d.get("records") or []):
+                    u = ((rec.get("value") or {}).get("subject") or {}).get("uri")
+                    if u and u != post_uri and u not in seen:
+                        seen.add(u)
+                        uris.append(u)
+            out["listrecords_calls"] = calls
+            out["candidates_seen"] = len(uris)
+            out["budget_exhausted"] = (
+                len(likers) >= ALSO_LIKED_MAX_LIKERS
+                or calls >= ALSO_LIKED_MAX_LISTRECORDS_CALLS
+                or len(uris) >= ALSO_LIKED_MAX_CANDIDATE_URIS)
+            if uris:
+                # Rank only the candidates we actually store: the public likes of
+                # strangers are mostly NOT in our corpus, and a post we have
+                # never seen has no engagement to rank on.
+                ph = ",".join("?" * len(uris))
+                rows = db().execute(
+                    f"SELECT uri, author_did, author_handle, like_count, repost_count, "
+                    f"quote_count, reply_count, text FROM posts WHERE uri IN ({ph})",
+                    list(uris)).fetchall()
+                cands = [{"uri": r[0], "author_did": r[1], "author_handle": r[2],
+                          "like_count": r[3], "repost_count": r[4],
+                          "quote_count": r[5], "reply_count": r[6], "text": r[7]}
+                         for r in rows]
+                out["in_corpus"] = len(cands)
+                out["candidates"] = discovery.rank_candidates(
+                    cands, weights_for(FEEDS_BY_RKEY.get(
+                        (q.get("feed") or [""])[0].strip(), {})),
+                    limit=limit, exclude=[post_uri],
+                    blocked=set(CFG.get("blocked_dids") or ()))
+            meta_set(ckey, f"{time.time()}|{json.dumps(out)}")
+            return self._send(200, out)
 
         if u.path == "/":
             return self._send(200, render_index_page(CFG), "text/html")
