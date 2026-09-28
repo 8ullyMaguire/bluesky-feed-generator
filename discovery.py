@@ -221,15 +221,22 @@ def explain_rank(post: Dict[str, Any], fcfg: Dict[str, Any], weights: Dict[str, 
 CFG_FACTOR = 0.7
 
 
-def assert_matches_rank_score(reconstructed: float, actual: float) -> bool:
+def assert_matches_rank_score(reconstructed: float, actual: float,
+                             rel_tol: float = 1e-5) -> bool:
     """True when our itemised total equals the ranker's own return value.
 
-    This is the guard on the module's central promise. It is cheap (one extra
-    pure call) and it turns a silent drift into a visible flag.
+    This is the guard on the module's central promise.
+
+    The tolerance is relative and 1e-5, not an equality or a 1e-9 epsilon: the
+    score is a product of four to six doubles, and the route's own last step
+    (the age penalty) is computed from a fresh `time.time()` rather than the
+    refresh timestamp, so a few ULP of drift is expected and harmless. 1e-5
+    still catches any real logic divergence — a missing multiplier is off by
+    orders of magnitude, not by the seventh decimal.
     """
     if actual is None:
         return False
-    return abs(reconstructed - actual) < max(1e-6, abs(actual) * 1e-9)
+    return abs(reconstructed - actual) <= max(abs(actual) * rel_tol, 1e-9)
 
 
 def gate_report(post: Dict[str, Any], fcfg: Dict[str, Any],

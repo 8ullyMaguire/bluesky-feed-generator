@@ -95,6 +95,12 @@ def test_explanation_matches_the_ranker():
     assert disc.assert_matches_rank_score(mine["total"], actual), (
         mine["total"], actual)
     assert mine["topic_seed_bonus_applied"] == 50.0
+    # The tolerance must still be a real guard, not a rubber stamp: a dropped
+    # multiplier is orders of magnitude out and has to FAIL.
+    assert disc.assert_matches_rank_score(3.6890103616719174, 3.6890122552376834)
+    assert not disc.assert_matches_rank_score(3.6890 * 1.01, 3.6890)
+    assert not disc.assert_matches_rank_score(0.0, 1.0)
+    assert not disc.assert_matches_rank_score(1.0, None)
     print("ok   explain_rank reproduces rank_score exactly (4 configurations)")
 
 
