@@ -75,6 +75,14 @@ from cryptography.exceptions import InvalidSignature
 
 import ranking_core
 
+# Discovery helpers (pure functions behind /why, /also-liked and /people).
+# Optional: a missing file must not stop the service from serving feeds, so the
+# import is guarded and the routes report themselves unavailable.
+try:
+    import discovery
+except Exception:                                   # noqa: BLE001
+    discovery = None
+
 # --- DID-doc cache for JWT verification (10-min TTL, in-memory) ---
 DID_DOC_CACHE_TTL = 600
 _DID_DOC_CACHE = {}  # did -> (doc_dict, fetched_ts)
@@ -118,6 +126,9 @@ PUBLISHER_DID = CFG["publisher_did"]
 FEEDS = {
     f"at://{PUBLISHER_DID}/app.bsky.feed.generator/{f['rkey']}": f for f in CFG["feeds"]
 }
+# The same feeds by bare rkey, for the public pages. One map, built once at
+# import from the same list FEEDS is built from, so the two can never disagree.
+FEEDS_BY_RKEY = {f["rkey"]: f for f in CFG["feeds"]}
 
 DB_PATH = os.environ.get("FEEDGEN_DB") or os.path.join(
     os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
@@ -129,7 +140,7 @@ LEGACY_STATE_PATH = os.environ.get("FEEDGEN_STATE_PATH") or os.path.join(
 CACHE: dict = {
     "feeds": {}, "feed_scores": {}, "updated": 0, "scanned": 0, "members": 0,
     "error": None, "gen": 0, "stats": {}, "state_uris": 0, "taste_authors": 0,
-    "topic_seeds": set(),
+    "topic_seeds": set(), "rank_ctx": {},
 }
 CACHE_LOCK = threading.Lock()
 DB_LOCK = threading.Lock()
@@ -1271,6 +1282,23 @@ def build_taste_ext():
     return counts
 
 
+def requester_from_headers(handler, expected_lxm="app.bsky.feed.getFeedSkeleton"):
+    """The requester's DID, or None. Never raises.
+
+    Every personalized surface resolves identity through this one call so that
+    "no identity" is always the same condition, always fail-closed, and never
+    an exception that a route would have to guess how to report.
+    """
+    auth = handler.headers.get("Authorization")
+    if not auth:
+        return None
+    try:
+        return verify_jwt(auth, expected_lxm)
+    except Exception as e:                          # noqa: BLE001
+        print(f"[{SVC_TAG}] jwt verify failed: {e}", flush=True)
+        return None
+
+
 def verify_jwt(auth_header, expected_lxm="app.bsky.feed.getFeedSkeleton"):
     """Verify JWT from Authorization header and extract requester DID.
 
@@ -2070,6 +2098,17 @@ def refresh():
         total_seen = db().execute("SELECT COUNT(*) FROM seen").fetchone()[0]
         CACHE["feed_scores"] = feed_scores
         CACHE["topic_seeds"] = set(topic_seeds)
+        # The ranking context, so /why can reproduce the score this generation
+        # actually used. Stored here rather than recomputed on request: these
+        # are the values the last refresh ran with, and a later recomputation
+        # could differ (taste rebuilds, keyword weights decay). Cached copies
+        # are read-only; the refresh overwrites them wholesale.
+        CACHE["rank_ctx"] = {
+            "topic_affinity": dict(topic_affinity),
+            "taste": dict(taste),
+            "author_priors": dict(priors),
+            "topic_keywords": ctx["topic_keywords"],
+        }
     log_metrics(CACHE["feeds"], CACHE.get("feed_scores") or {}, time.time())
     fstats["state_uris"] = total_seen
     fstats["taste_authors"] = len(taste)
@@ -2334,6 +2373,18 @@ def render_status_page(snap, cfg):
             "(SELECT COUNT(*) FROM user_affinity)").fetchone()
     except sqlite3.Error:
         pstats = (0, 0, 0)
+    # How many DIFFERENT people this deployment is personalizing for right now.
+    # The "requesters=" figure above is a lifetime distinct count on a table
+    # that mostly records the owner; the 24h number is the one that says
+    # whether strangers are arriving at all, so both are shown.
+    try:
+        rq24 = db().execute(
+            "SELECT COUNT(DISTINCT requester_did) FROM served_posts "
+            "WHERE served_at > ?", (time.time() - 86400,)).fetchone()[0] or 0
+        rqall = db().execute(
+            "SELECT COUNT(DISTINCT requester_did) FROM served_posts").fetchone()[0] or 0
+    except sqlite3.Error:
+        rq24 = rqall = 0
     mrows = ""
     try:
         for rk, n, ua, ma, sm, sp in db().execute(
@@ -2365,6 +2416,8 @@ def render_status_page(snap, cfg):
         f"db={os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0} bytes</p>"
         f"<p>personalization: requesters={pstats[0]} events={pstats[1]} "
         f"affinity_rows={pstats[2]}</p>"
+        f"<p>requesters: {rq24} distinct DID(s) served in 24h; "
+        f"lifetime {rqall}</p>"
         f"<p>hide: " + " ".join(
             f"{rk}=excl{h.get('excluded', 0)}/board{h.get('board', 0)}"
             for rk, h in sorted((snap.get("hide_stats") or {}).items()))
@@ -2486,6 +2539,95 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, out, headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate",
                 "Pragma": "no-cache"})
+
+        if u.path == "/why":
+            if discovery is None:
+                return self._send(503, {"ok": False, "reason": "discovery module unavailable"})
+            post_uri = (q.get("post") or [""])[0].strip()
+            rkey = (q.get("feed") or [""])[0].strip()
+            fcfg = FEEDS_BY_RKEY.get(rkey)
+            if not post_uri or not fcfg:
+                return self._send(404, {"ok": False, "reason": "unknown feed or post"})
+            row = db().execute(
+                "SELECT author_did, author_handle, like_count, repost_count, "
+                "quote_count, reply_count, text, indexed_at FROM posts WHERE uri=?",
+                (post_uri,)).fetchone()
+            if not row:
+                return self._send(404, {"ok": False, "reason": "not in corpus"})
+            (author_did, handle, likes, reposts, quotes, replies,
+             text, indexed_at) = row
+            # Rebuild the AppView shape rank_score() reads. The stored row is
+            # columnar; the ranker is written against the API object.
+            p = {"uri": post_uri, "author": {"did": author_did, "handle": handle},
+                 "record": {"text": text or ""},
+                 "likeCount": likes, "repostCount": reposts,
+                 "quoteCount": quotes, "replyCount": replies}
+            try:
+                age_h = max(0.0, (time.time() - parse_time(indexed_at)).total_seconds()
+                            / 3600.0)
+            except (ValueError, TypeError):
+                age_h = 0.0
+            w = weights_for(fcfg)
+            # The ranker's own context, read from the CURRENT cache generation
+            # where it exists. A stale or missing taste map must not crash the
+            # explanation; it is reported as such instead.
+            with CACHE_LOCK:
+                rank_ctx = dict(CACHE.get("rank_ctx") or {})
+                seeds = set(CACHE.get("topic_seeds") or ())
+                gen = CACHE.get("gen")
+            ctx = {"topic_affinity": rank_ctx.get("topic_affinity") or {},
+                   "taste": rank_ctx.get("taste") or {},
+                   "topic_seeds": seeds,
+                   "author_priors": rank_ctx.get("author_priors") or {},
+                   "topic_keywords": (rank_ctx.get("topic_keywords")
+                                      or [k.lower() for k in (CFG.get("topic_keywords") or [])])}
+            kws = [k.lower() for k in (CFG.get("topic_keywords") or [])]
+            terms = discovery.keyword_terms(text or "", kws)
+            brk = discovery.score_breakdown(p, w)
+            rank = discovery.explain_rank(
+                p, fcfg, w, age_h, ctx,
+                CFG.get("topic_keyword_weight_factor", 0.7))
+            # The drift guard. rank_score() is the ranker; the itemised total is
+            # our reading of it. If they ever disagree, say so in the payload
+            # rather than showing a number we cannot back.
+            actual = rank_score(p, fcfg, w, age_h, ctx)
+            verified = discovery.assert_matches_rank_score(rank["total"], actual)
+            # Personalization: identity or nothing. /why reports WHICH.
+            did = requester_from_headers(self)
+            aff = None
+            if did:
+                ua = db().execute(
+                    "SELECT score FROM user_affinity WHERE requester_did=? "
+                    "AND author_did=?", (did, author_did)).fetchone()
+                if ua:
+                    aff = float(ua[0])
+            trow = db().execute(
+                "SELECT likes_count FROM taste WHERE author_did=?",
+                (author_did,)).fetchone()
+            payload = {
+                "ok": True, "feed": rkey, "post": post_uri,
+                "author": handle or author_did,
+                "score": rank["total"], "base": brk["base"], "raw": brk["raw"],
+                "breakdown": brk["parts"], "ranking": rank["steps"],
+                "time": rank["time"], "gates": discovery.gate_report(p, fcfg, rank["total"]),
+                "topic": terms,
+                "topic_seed_bonus": rank["topic_seed_bonus_applied"],
+                "owner_taste_likes": int(trow[0]) if trow and trow[0] is not None else None,
+                "cache_generation": gen,
+                "verified_against_ranker": verified,
+                "personalized": {
+                    "ok": aff is not None,
+                    "reason": ("affinity from your interactions" if aff is not None
+                               else ("identity resolved, no signal for this author yet"
+                                     if did else "identity not supplied")),
+                    "affinity": aff,
+                },
+            }
+            if not verified:
+                payload["ranker_returned"] = actual
+            payload["summary"] = discovery.summarize(
+                brk, rank, aff is not None, terms)
+            return self._send(200, payload)
 
         if u.path == "/":
             return self._send(200, render_index_page(CFG), "text/html")
