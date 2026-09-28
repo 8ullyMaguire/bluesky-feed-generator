@@ -76,6 +76,16 @@ from cryptography.exceptions import InvalidSignature
 
 import ranking_core
 
+# Taste-quiz budgets. The quiz is the one write path a stranger can reach
+# unauthenticated, so its inputs are capped before anything is looked up.
+QUIZ_MAX_PICKS = 50
+QUIZ_POSTS = 10
+QUIZ_POSITIVE = 0.6
+QUIZ_NEGATIVE = -0.4
+# How long one quiz submission counts for. The key rotates with this, so a
+# stale key cannot be replayed tomorrow.
+QUIZ_TTL_SECONDS = 86400
+
 # /also-liked fan-out budgets. A public endpoint that reaches out to 20
 # accounts is a load multiplier on one box behind a tunnel; these caps ARE the
 # safety property. Do not raise them for better results.
@@ -309,6 +319,27 @@ CREATE TABLE IF NOT EXISTS user_hidden (
     PRIMARY KEY (requester_did, post_uri)
 );
 CREATE INDEX IF NOT EXISTS idx_user_hidden_req ON user_hidden(requester_did, created_at);
+
+-- Quiz taste, for a website visitor with no Bluesky session. Keyed on a
+-- daily-rotating pseudonym (see visitor_key), NEVER on a DID and never joined
+-- to one: a separate table precisely so no future query has to ask "is this
+-- requester_did column holding a real identity or a pseudonym?".
+CREATE TABLE IF NOT EXISTS visitor_affinity (
+    visitor_key   TEXT NOT NULL,
+    author_did    TEXT NOT NULL,
+    score         REAL NOT NULL DEFAULT 0,
+    updated_at    REAL NOT NULL,
+    PRIMARY KEY (visitor_key, author_did)
+);
+CREATE INDEX IF NOT EXISTS idx_vaff_visitor ON visitor_affinity(visitor_key, score);
+
+CREATE TABLE IF NOT EXISTS visitor_negative_terms (
+    visitor_key   TEXT NOT NULL,
+    term          TEXT NOT NULL,
+    hits          INTEGER NOT NULL DEFAULT 0,
+    updated_at    REAL NOT NULL,
+    PRIMARY KEY (visitor_key, term)
+);
 
 CREATE TABLE IF NOT EXISTS user_negative_terms (
     requester_did TEXT NOT NULL,
@@ -2253,12 +2284,234 @@ h3 { font-size: 1.05rem; margin: 0 0 .35rem; }
 .community { padding-left: 1.2rem; }
 footer { margin-top: 3rem; font-size: .85rem; opacity: .85; }
 footer .note { opacity: .7; }
+a.cta-primary, .cta-primary { display: inline-block; background: #d7ff3f;
+       color: #12100e; padding: .7rem 1.1rem; border-radius: .5rem;
+       font-weight: 700; text-decoration: none; }
+a.cta-secondary { display: inline-block; margin-left: .6rem; padding: .7rem 1.1rem;
+       border: 1px solid rgba(236,231,223,.4); border-radius: .5rem;
+       color: inherit; text-decoration: none; }
 a.gh { display: inline-flex; align-items: center; gap: .4rem; padding: .35rem .7rem;
        border: 1px solid rgba(127,127,127,.45); border-radius: .45rem;
        text-decoration: none; color: inherit; font-weight: 600; }
 a.gh:hover { border-color: rgba(127,127,127,.8); }
 a.gh .star { font-size: 1.05em; }
 """
+
+
+
+PAGE_CSS2 = """
+body { margin: 0; background: #12100e; color: #ece7df;
+       font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+main { max-width: 54rem; margin: 0 auto; padding: 2rem 1.1rem 4rem; }
+h1 { line-height: 1.15; margin: 0 0 .4rem; }
+h2 { margin: 2.2rem 0 .6rem; font-size: 1.05rem; letter-spacing: .02em; }
+p { margin: .5rem 0; }
+.lede { opacity: .78; margin-bottom: 1.2rem; }
+.cta-primary { display: inline-block; background: #d7ff3f; color: #12100e;
+               padding: .7rem 1.1rem; border-radius: .5rem; font-weight: 700;
+               text-decoration: none; }
+.cta-secondary { display: inline-block; margin-left: .6rem; padding: .7rem 1.1rem;
+                  border: 1px solid rgba(236,231,223,.4); border-radius: .5rem;
+                  color: inherit; text-decoration: none; }
+.cards { display: grid; gap: .8rem; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
+.card { border: 1px solid rgba(236,231,223,.18); border-radius: .55rem; padding: .8rem .9rem; }
+.card h3 { margin: 0 0 .3rem; font-size: .98rem; }
+.card .txt { opacity: .8; font-size: .9rem; margin: .3rem 0 .5rem;
+             max-height: 5.4em; overflow: hidden; }
+.pick { display: flex; gap: .4rem; align-items: baseline; }
+.pick label { font-size: .85rem; padding: .2rem .5rem; border-radius: .4rem;
+              border: 1px solid rgba(236,231,223,.28); cursor: pointer; }
+table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid rgba(236,231,223,.15); }
+.note { opacity: .6; font-size: .82rem; margin-top: 2rem; }
+a { color: #d7ff3f; }
+code { opacity: .8; }
+.empty { opacity: .65; font-style: italic; }
+"""
+
+
+def _page(title, body, note=""):
+    """One shared shell for the new pages. The <style> is inlined, never linked."""
+    e = html.escape
+    return f"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{e(title)}</title>
+<style>{PAGE_CSS2}</style>
+</head>
+<body>
+<main>
+{body}
+<p class="note">{e(note)}</p>
+</main>
+</body>
+</html>""".encode()
+
+
+def quiz_posts(limit=None):
+    """A deterministic spread of corpus posts for the quiz.
+
+    Deterministic on purpose: the same corpus gives the same quiz, so a visitor
+    who reloads is not answering a different question. Ordered by engagement so
+    the picks are recognisable posts rather than the quietest rows, then spread
+    evenly across that ranking so the sample is not all one author.
+    """
+    n = int(limit or QUIZ_POSTS)
+    rows = db().execute(
+        "SELECT uri, author_handle, text, like_count FROM posts "
+        "WHERE text IS NOT NULL AND text != '' AND author_did != ? "
+        "ORDER BY (like_count + 3 * repost_count) DESC LIMIT 200",
+        ((CFG.get("owner") or {}).get("did") or "",)).fetchall()
+    if not rows:
+        return []
+    step = max(1, len(rows) // n)
+    picks = [rows[i] for i in range(0, len(rows), step)][:n]
+    return [{"uri": r[0], "handle": r[1] or "cuenta", "text": (r[2] or "")[:220],
+             "likes": r[3] or 0} for r in picks]
+
+
+def render_quiz_page(cfg):
+    """/quiz: pick more like / less like. A plain form; no JavaScript at all.
+
+    The visitor-key line is not a disclaimer buried in a footer: it is the
+    answer to "who is this recording about", stated once, plainly, before
+    anyone invests effort in answering.
+    """
+    e = html.escape
+    posts = quiz_posts()
+    if not posts:
+        return _page("Quiz de gusto", "<h1>Quiz de gusto</h1>"
+                     "<p class='empty'>Todavia no hay posts suficientes.</p>",
+                     "Este servicio guarda tus picks durante un dia, con una "
+                     "clave anonima que no es tu identidad.")
+    cards = []
+    for p in posts:
+        cards.append(
+            f'<div class="card"><h3>@{e(p["handle"])}</h3>'
+            f'<p class="txt">{e(p["text"])}</p>'
+            f'<div class="pick">'
+            f'<label><input type="checkbox" name="more" value="{e(p["uri"])}"> me gusta mas</label>'
+            f'<label><input type="checkbox" name="less" value="{e(p["uri"])}"> me gusta menos</label>'
+            f"</div></div>")
+    body = (
+        "<h1>Que te gusta</h1>"
+        "<p class='lede'>Marca los posts que quieres ver mas en tu feed, y los que "
+        "quieres ver menos. Con una eleccion, el feed de la app lo tendra en cuenta.</p>"
+        f'<form method="post" action="/xrpc/app.bsky.feed.discovery.v1/submitTaste">'
+        f'<div class="cards">{"".join(cards)}</div>'
+        '<p><button class="cta-primary" type="submit">Guardar mis choices</button></p>'
+        "</form>"
+        "<h2>Que guardamos</h2>"
+        "<p>Guardamos que autores te gustan mas y que palabras evitar, con una clave "
+        "diaria y anonima derivada de tu navegador. <b>No es tu identidad</b>, no se "
+        "asocia a tu cuenta de Bluesky, y caduca al dia siguiente. Las cuentas que ya "
+        "tienen sesion en la app usan su propio historial de likes, que si es personal.</p>")
+    return _page("Quiz de gusto", body, "Sin scripts, sin recursos externos.")
+
+
+def render_stats_page(cfg):
+    """/stats: public proof, AGGREGATE ONLY. No per-requester identifier.
+
+    Every figure here is a count or a mean over a whole deployment. The page
+    deliberately does not link to /taste or /people, because those are per-person
+    and a "statistics" page that quietly exposes them is not a statistics page.
+    """
+    e = html.escape
+    try:
+        depth = {f["rkey"]: len(CACHE["feeds"].get(f["rkey"], [])) for f in cfg["feeds"]}
+    except Exception:                                          # noqa: BLE001
+        depth = {f["rkey"]: 0 for f in cfg["feeds"]}
+    try:
+        with CACHE_LOCK:
+            rq24 = db().execute(
+                "SELECT COUNT(DISTINCT requester_did) FROM served_posts "
+                "WHERE served_at > ?", (time.time() - 86400,)).fetchone()[0] or 0
+            served = db().execute("SELECT COUNT(*) FROM served_posts").fetchone()[0]
+            posts_n = db().execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+            authors = db().execute(
+                "SELECT COUNT(DISTINCT author_did) FROM posts").fetchone()[0]
+        updated = time.time() - float(CACHE.get("updated") or 0)
+    except sqlite3.Error:
+        rq24 = served = posts_n = authors = 0
+        updated = 0
+    try:
+        member_n = (CACHE.get("members") or 0)
+    except Exception:                                          # noqa: BLE001
+        member_n = 0
+    rows = "".join(f"<tr><td>{e(rk)}</td><td>{n}</td></tr>"
+                   for rk, n in sorted(depth.items()))
+    mins = int(updated // 60)
+    body = (
+        "<h1>Como esta funcionando</h1>"
+        "<p class='lede'>Cuentas agregadas, sin datos de ninguna persona.</p>"
+        "<h2>Volumen</h2>"
+        f"<table><tr><th>Medida</th><th>Valor</th></tr>"
+        f"<tr><td>personas distintas servidas en 24h</td><td>{rq24}</td></tr>"
+        f"<tr><td>posts entregados (hist&oacute;rico)</td><td>{served}</td></tr>"
+        f"<tr><td>posts en el corpus</td><td>{posts_n}</td></tr>"
+        f"<tr><td>autores distintos</td><td>{authors}</td></tr>"
+        f"<tr><td>integrantes de la lista</td><td>{member_n}</td></tr>"
+        f"<tr><td>ultima actualizacion</td><td>hace {mins} min</td></tr></table>"
+        "<h2>Profundidad por feed</h2>"
+        f"<table><tr><th>Feed</th><th>posts en la cola</th></tr>{rows}</table>")
+    return _page("Estadisticas", body,
+                 "Agregados unicamente: ninguna cuenta individual aparece aqui.")
+
+
+def render_taste_page(cfg, did, vkey):
+    """/taste: what is steering MY feed. The caller's own rows and nothing else.
+
+    With a DID, reads user_affinity / user_negative_terms / served_posts. With
+    only a visitor cookie, reads the quiz's visitor tables. With neither, it
+    says so in plain words and returns 200 -- never a 500, never a login wall.
+    """
+    e = html.escape
+    if did:
+        aff = db().execute(
+            "SELECT a.author_did, a.score, p.author_handle FROM user_affinity a "
+            "LEFT JOIN posts p ON p.author_did = a.author_did "
+            "WHERE a.requester_did=? ORDER BY ABS(a.score) DESC LIMIT 25",
+            (did,)).fetchall()
+        neg = db().execute(
+            "SELECT term, hits FROM user_negative_terms WHERE requester_did=? "
+            "ORDER BY hits DESC, term LIMIT 40", (did,)).fetchall()
+        served = db().execute(
+            "SELECT COUNT(*) FROM served_posts WHERE requester_did=?",
+            (did,)).fetchone()[0] or 0
+        who = f"tu sesion ({e(did[:22])})"
+    elif vkey:
+        aff = db().execute(
+            "SELECT a.author_did, a.score, p.author_handle FROM visitor_affinity a "
+            "LEFT JOIN posts p ON p.author_did = a.author_did "
+            "WHERE a.visitor_key=? ORDER BY ABS(a.score) DESC LIMIT 25",
+            (vkey,)).fetchall()
+        neg = db().execute(
+            "SELECT term, hits FROM visitor_negative_terms WHERE visitor_key=? "
+            "ORDER BY hits DESC, term LIMIT 40", (vkey,)).fetchall()
+        served = 0
+        who = "el quiz de esta visita (clave diaria, no una identidad)"
+    else:
+        return _page(
+            "Tu gusto",
+            "<h1>Tu gusto</h1><p class='empty'>Necesitamos saber quien eres: "
+            "abre esta pagina desde la app de Bluesky, o haz el <a href='/quiz'>quiz</a> "
+            "para contarnos que te gusta.</p>",
+            "Esta pagina solo muestra lo tuyo.")
+    rows = "".join(f"<tr><td>@{e(h or d[:18])}</td><td>{round(float(s), 3)}</td></tr>"
+                   for d, s, h in aff) or "<tr><td colspan=2 class='empty'>aun nada</td></tr>"
+    nrows = "".join(f"<tr><td>{e(t)}</td><td>{h}</td></tr>" for t, h in neg) or         "<tr><td colspan=2 class='empty'>ninguno todavia</td></tr>"
+    body = (
+        "<h1>Que esta guiando tu feed</h1>"
+        f"<p class='lede'>Datos de {who}.</p>"
+        "<h2>Autores que te gustan mas</h2>"
+        f"<table><tr><th>Autor</th><th>Afinidad</th></tr>{rows}</table>"
+        "<h2>Palabras que pediste ver menos</h2>"
+        f"<table><tr><th>Palabra</th><th>Veces</th></tr>{nrows}</table>"
+        "<h2>Entregas</h2>"
+        f"<p>{served} posts entregados a esta sesion.</p>")
+    return _page("Tu gusto", body, "Solo tus propios datos. Nada sale de este servidor.")
 
 
 def page_cfg(cfg):
@@ -2310,6 +2563,15 @@ def render_index_page(cfg):
     labels = page["labels"]
     handle = ((cfg.get("owner") or {}).get("handle") or "").lstrip("@")
     cards = "".join(render_feed_card(cfg, f) for f in cfg.get("feeds", []))
+    # The primary CTA and the quiz entry point, above the grid. A visitor who
+    # lands here has no reason yet to care which of eleven feeds is "for you".
+    fy = next((f["rkey"] for f in cfg.get("feeds", [])
+               if "foryou" in f["rkey"]), "")
+    cta = ""
+    if fy:
+        cta = (f'<p><a class="cta-primary" href="{e(feed_open_url(cfg, fy))}">'
+               f'Abrir el feed Para Ti</a>'
+               f'<a class="cta-secondary" href="/quiz">Di que te gusta</a></p>')
     faq = "".join(f'<details><summary>{e(i.get("q", ""))}</summary>'
                   f'<p>{e(i.get("a", ""))}</p></details>'
                   for i in page["faq"])
@@ -2336,6 +2598,8 @@ def render_index_page(cfg):
     if page["repo"]:
         links.append(f'<a href="{e(page["repo"])}">{e(labels["repo_link"])}</a>')
     links.append(f'<a href="/status">{e(labels["status_link"])}</a>')
+    links.append('<a href="/stats">Estadisticas</a>')
+    links.append('<a href="/quiz">Quiz</a>')
     footer.append("<p>" + " · ".join(links) + "</p>")
     footer.append(f'<p class="note">{e(labels["note"])}</p>')
     doc = f"""<!doctype html>
@@ -2353,8 +2617,15 @@ def render_index_page(cfg):
 <p class="cta"><a href="https://bsky.app/profile/{e(handle)}">@{e(handle)} on Bluesky &rarr;</a></p>
 <h2>{e(page["how_title"])}</h2>
 <ol class="how">{"".join(f"<li>{e(s)}</li>" for s in page["how"])}</ol>
+{cta}
 <h2>{e(page["feeds_title"])}</h2>
 <div class="feeds">{cards}</div>
+<h2>Como funciona la personalizacion</h2>
+<p>Cuanto mas usas el feed, mas se ajusta: aprende de lo que miras y de lo que
+marcas. Funciona cuando tu app se conecta directamente a este servicio; cuando la
+lectura pasa por un proxy intermedio no hay identidad, y el feed se sirve sin
+personalizar en lugar de fingir lo contrario. Nunca usamos bloqueos ni silencios
+para ordenar lo que ves, igual que el For You de Bluesky.</p>
 {community}
 <h2>{e(page["faq_title"])}</h2>
 <section class="faq">{faq}</section>
@@ -2366,6 +2637,107 @@ def render_index_page(cfg):
 </html>"""
     return doc.encode()
 
+
+
+def visitor_key(headers_obj):
+    """A daily-rotating pseudonym for an anonymous website visitor.
+
+    NOT an identity, and never linked to one. It exists so someone who arrived
+    through the website can tell the service what they like before they have a
+    Bluesky session. Keyed on address + user agent + a salt that rolls at
+    midnight UTC, so yesterday's key cannot be replayed today. The quiz page
+    says exactly this, in one line.
+    """
+    day = int(time.time() // 86400)
+    ip = headers_obj.get("X-Forwarded-For", "").split(",")[0].strip()
+    if not ip:
+        try:
+            ip = headers_obj.client_address[0]
+        except (AttributeError, IndexError):
+            ip = "unknown"
+    ua = headers_obj.get("User-Agent", "")
+    h = hashlib.sha256(f"vk-{day}|{ip}|{ua}".encode("utf-8", "replace")).hexdigest()
+    return h[:32]
+
+
+def visitor_cookie(vkey):
+    return f"taste_key={vkey}; Path=/; Max-Age={QUIZ_TTL_SECONDS}; SameSite=Lax"
+
+
+def visitor_from_cookie(headers_obj):
+    for part in (headers_obj.get("Cookie", "") or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == "taste_key" and v:
+            return v[:32]
+    return None
+
+
+def quiz_redirect(cfg):
+    """Where a finished quiz sends the visitor: the For You feed in the app."""
+    rkey = next((f["rkey"] for f in cfg.get("feeds", [])
+                 if "foryou" in f["rkey"]), "")
+    return feed_open_url(cfg, rkey) if rkey else "https://bsky.app"
+
+
+def like_profile(did):
+    """{author_did: like count} for one account, from its public like history.
+
+    user_likes stores only the post URI and the author is inside an AT-URI, so
+    this is a projection over rows already held, not a join against `posts`:
+    most liked posts are not in our corpus at all.
+    """
+    rows = db().execute(
+        "SELECT post_uri FROM user_likes WHERE requester_did=?", (did,)).fetchall()
+    vec = {}
+    for (uri,) in rows:
+        a = discovery.author_of_uri(uri) if discovery else ""
+        if a:
+            vec[a] = vec.get(a, 0.0) + 1.0
+    return vec
+
+
+def like_profiles(limit_accounts=2000):
+    """({account_did: {author_did: count}}, {did: handle}) over user_likes.
+
+    Built from user_likes, NOT from taste or taste_ext: those hold the
+    deployment curator's single flattened preference map with no per-account
+    dimension, so a cosine over them compares an author against itself.
+    """
+    accounts = [r[0] for r in db().execute(
+        "SELECT DISTINCT requester_did FROM user_likes LIMIT ?",
+        (int(limit_accounts),)).fetchall()]
+    prof = {}
+    for did in accounts:
+        v = like_profile(did)
+        if v:
+            prof[did] = v
+    handles = {}
+    for did, h in db().execute(
+            "SELECT author_did, author_handle FROM posts "
+            "WHERE author_did IS NOT NULL").fetchall():
+        if h:
+            handles.setdefault(did, h)
+    return prof, handles
+
+
+def similar_accounts(did, limit=10, blocked=None):
+    """Accounts whose public like history most overlaps `did`'s, best first."""
+    if discovery is None:
+        return []
+    target = like_profile(did)
+    if not target:
+        return []
+    prof, handles = like_profiles()
+    out = []
+    for other, vec in prof.items():
+        if other == did or (blocked and other in blocked):
+            continue
+        s = discovery.cosine_similarity(target, vec)
+        if s > 0:
+            out.append({"did": other, "handle": handles.get(other, other),
+                        "score": round(s, 6)})
+    out.sort(key=lambda r: (-r["score"], r["did"]))
+    return out[:int(limit)]
 
 def render_status_page(snap, cfg):
     """The operator view (also /health): board sizes, gate counts, last refresh.
@@ -2735,6 +3107,44 @@ class Handler(BaseHTTPRequestHandler):
             meta_set(ckey, f"{time.time()}|{json.dumps(out)}")
             return self._send(200, out)
 
+        if u.path == "/quiz":
+            return self._send(200, render_quiz_page(CFG), "text/html")
+
+        if u.path == "/stats":
+            return self._send(200, render_stats_page(CFG), "text/html")
+
+        if u.path == "/people":
+            if discovery is None:
+                return self._send(503, {"ok": False, "reason": "discovery module unavailable"})
+            handle = (q.get("handle") or [""])[0].strip().lstrip("@")
+            if not handle:
+                return self._send(400, {"ok": False, "reason": "handle required"})
+            av = CFG.get("source", {}).get("appview_host", "https://public.api.bsky.app")
+            did = handle if handle.startswith("did:") else None
+            if not did:
+                try:
+                    did = rpc(av, "com.atproto.identity.resolveHandle?" +
+                              urllib.parse.urlencode({"handle": handle})).get("did")
+                except Exception as e:                      # noqa: BLE001
+                    print(f"[{SVC_TAG}] resolveHandle failed for {handle}: {e}",
+                          flush=True)
+                    did = None
+            if not did:
+                return self._send(404, {"ok": False, "reason": "unknown handle"})
+            people = similar_accounts(did, limit=10,
+                                      blocked=set(CFG.get("blocked_dids") or ()))
+            if not people:
+                return self._send(404, {"ok": False,
+                                        "reason": "no comparable like history for that account"})
+            return self._send(200, {"ok": True, "target": did,
+                                    "method": "cosine over public like history",
+                                    "people": people})
+
+        if u.path == "/taste":
+            did = requester_from_headers(self)
+            vkey = visitor_from_cookie(self.headers)
+            return self._send(200, render_taste_page(CFG, did, vkey), "text/html")
+
         if u.path == "/":
             return self._send(200, render_index_page(CFG), "text/html")
 
@@ -2749,9 +3159,81 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/xrpc/app.bsky.feed.discovery.v1/submitTaste":
+            return self._handle_submit_taste()
         if u.path == "/xrpc/app.bsky.feed.sendInteractions":
             return self._handle_send_interactions()
         return self._send(404, {"error": "NotFound"})
+
+
+    def _handle_submit_taste(self):
+        """Taste quiz submission: the only write a stranger can reach without
+        an account, so it is bounded, idempotent, and it never writes a DID.
+
+        A urlencoded form body and a JSON body are both accepted: the page works
+        with JavaScript disabled, so the plain form path is the one that runs.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+        except ValueError:
+            raw = b""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        if ctype == "application/json":
+            try:
+                data = json.loads(raw or b"{}")
+            except ValueError:
+                return self._send(400, {"ok": False, "reason": "bad json"})
+        else:
+            form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+            data = {"more": form.get("more") or [], "less": form.get("less") or []}
+        more = [u for u in (data.get("more") or [])
+                if isinstance(u, str) and u][:QUIZ_MAX_PICKS]
+        less = [u for u in (data.get("less") or [])
+                if isinstance(u, str) and u][:QUIZ_MAX_PICKS]
+        if not more and not less:
+            return self._send(400, {"ok": False, "reason": "no picks"})
+        vkey = visitor_key(self.headers)
+        # Idempotence BEFORE the writes: one submission per visitor per day.
+        if meta_get(f"quiz:{vkey}"):
+            return self._send(200, {"ok": True, "duplicate": True, "wrote": 0,
+                                    "redirect": quiz_redirect(CFG)},
+                              headers={"Set-Cookie": visitor_cookie(vkey)})
+        now = time.time()
+        rows, neg_rows, wrote, seen = [], [], 0, set()
+        for uri, score in ([(u, QUIZ_POSITIVE) for u in more]
+                           + [(u, QUIZ_NEGATIVE) for u in less]):
+            did = discovery.author_of_uri(uri) if discovery else ""
+            if not did or (did, score) in seen:
+                continue
+            seen.add((did, score))
+            row = db().execute("SELECT text FROM posts WHERE uri=?", (uri,)).fetchone()
+            if row is None:
+                continue          # a URI we do not have cannot be scored
+            rows.append((vkey, did, score, now))
+            if score < 0:
+                for t in extract_terms(row[0] or ""):
+                    neg_rows.append((vkey, t, now))
+            wrote += 1
+        with DB_LOCK:
+            if rows:
+                db().executemany(
+                    "INSERT INTO visitor_affinity(visitor_key, author_did, score, "
+                    "updated_at) VALUES(?,?,?,?) ON CONFLICT(visitor_key, author_did) "
+                    "DO UPDATE SET score=excluded.score, updated_at=excluded.updated_at",
+                    rows)
+            if neg_rows:
+                db().executemany(
+                    "INSERT INTO visitor_negative_terms(visitor_key, term, hits, "
+                    "updated_at) VALUES(?,?,1,?) ON CONFLICT(visitor_key, term) "
+                    "DO UPDATE SET hits=visitor_negative_terms.hits+1, "
+                    "updated_at=excluded.updated_at", neg_rows)
+            db().commit()
+        meta_set(f"quiz:{vkey}", now)
+        print(f"[{SVC_TAG}] quiz: {wrote} authors from {vkey[:12]}", flush=True)
+        return self._send(200, {"ok": True, "duplicate": False, "wrote": wrote,
+                                "redirect": quiz_redirect(CFG)},
+                          headers={"Set-Cookie": visitor_cookie(vkey)})
 
     def _handle_send_interactions(self):
         """app.bsky.feed.sendInteractions — per the lexicon each interaction
