@@ -1,0 +1,10 @@
+[Unit]
+Description=Bluesky feed generator maintenance every 15 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

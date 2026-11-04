@@ -1,0 +1,13 @@
+# Template: maintenance pass for one deployment.
+# Install to ~/.config/systemd/user/<name>-maintenance.service with the three
+# paths below pointed at that deployment.
+[Unit]
+Description=Bluesky feed generator maintenance pass
+After=feedgen.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/USER/DEPLOYMENT
+Environment=FEEDGEN_CONFIG=/home/USER/DEPLOYMENT/config.json
+Environment=FEEDGEN_DB=/home/USER/.local/share/DEPLOYMENT/feedgen.sqlite
+ExecStart=/usr/bin/python3 /path/to/bluesky-feed-generator/maintenance.py
