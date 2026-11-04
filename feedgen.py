@@ -105,7 +105,39 @@ except Exception:                                   # noqa: BLE001
 
 # --- DID-doc cache for JWT verification (10-min TTL, in-memory) ---
 DID_DOC_CACHE_TTL = 600
-_DID_DOC_CACHE = {}  # did -> (doc_dict, fetched_ts)
+_DID_DOC_CACHE = {}
+CACHE = {}  # did -> (doc_dict, fetched_ts)
+FEED_RANKED_AT = {}  # rkey -> last time its board was ranked
+# Rolling candidate corpus. Incremental paging means a cycle sees only a few
+# pages of new posts; ranking still needs the whole window, so the corpus is
+# merged forward instead of rebuilt. Bounded by CORPUS_MAX and by the longest
+# feed window, which is what a full crawl would have produced anyway.
+CORPUS = {"by_uri": {}}
+CORPUS_MAX = 40000
+
+
+def merge_corpus(posts, max_age_hours):
+    """Merge freshly fetched posts into the rolling corpus, prune, cap."""
+    now = time.time()
+    cutoff = now - float(max_age_hours) * 3600
+    d = CORPUS["by_uri"]
+    for p in posts:
+        uri = p.get("uri")
+        if uri:
+            d[uri] = p
+    for uri, p in list(d.items()):
+        ts = p.get("indexedAt") or (p.get("record") or {}).get("createdAt")
+        try:
+            if ts and parse_time(ts).timestamp() < cutoff:
+                del d[uri]
+        except (ValueError, TypeError):
+            continue
+    if len(d) > CORPUS_MAX:
+        newest = sorted(d.items(), key=lambda kv: (
+            kv[1].get("indexedAt") or ""), reverse=True)[:CORPUS_MAX]
+        CORPUS["by_uri"] = dict(newest)
+        d = CORPUS["by_uri"]
+    return list(d.values())
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -210,6 +242,36 @@ CREATE TABLE IF NOT EXISTS seen (
     PRIMARY KEY (rkey, uri)
 );
 CREATE INDEX IF NOT EXISTS idx_seen_shown ON seen(rkey, shown_at);
+
+CREATE TABLE IF NOT EXISTS growth_votes (
+    author_did  TEXT NOT NULL,
+    voter_did   TEXT NOT NULL,
+    author_handle TEXT DEFAULT '',
+    first_seen  REAL NOT NULL,
+    last_seen   REAL NOT NULL,
+    PRIMARY KEY (author_did, voter_did)
+);
+CREATE INDEX IF NOT EXISTS idx_growth_votes_did ON growth_votes(author_did);
+
+CREATE TABLE IF NOT EXISTS growth_members (
+    author_did  TEXT PRIMARY KEY,
+    handle      TEXT DEFAULT '',
+    status      TEXT NOT NULL,
+    added_at    REAL NOT NULL,
+    expires_at  REAL NOT NULL,
+    votes       INTEGER DEFAULT 0,
+    likes_at_admit INTEGER DEFAULT 0,
+    last_post   REAL DEFAULT 0,
+    source      TEXT DEFAULT 'co-like'
+);
+
+CREATE TABLE IF NOT EXISTS served_daily (
+    feed_rkey   TEXT NOT NULL,
+    day         TEXT NOT NULL,
+    serves      INTEGER NOT NULL DEFAULT 0,
+    requesters  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (feed_rkey, day)
+);
 
 CREATE TABLE IF NOT EXISTS author_topic (
     author_did  TEXT PRIMARY KEY,
@@ -400,6 +462,19 @@ def migrate_schema():
             "PRAGMA table_info(served_posts)").fetchall()}
         if "polled_at" not in sp:
             db().execute("ALTER TABLE served_posts ADD COLUMN polled_at REAL DEFAULT 0")
+        # Measurement layer: the stages select() already counts are persisted,
+        # so a change can be attributed to a stage instead of inferred from the
+        # rendered /status page.
+        ml = {r[1] for r in db().execute(
+            "PRAGMA table_info(metrics_log)").fetchall()}
+        for col in ("in_window", "post_gate", "suppressed", "final", "served"):
+            if col not in ml:
+                db().execute(
+                    f"ALTER TABLE metrics_log ADD COLUMN {col} INTEGER DEFAULT 0")
+        db().execute("CREATE INDEX IF NOT EXISTS idx_served_feed_time "
+                     "ON served_posts(feed_rkey, served_at)")
+        db().execute("CREATE INDEX IF NOT EXISTS idx_events_kind_time "
+                     "ON interaction_events(kind, created_at)")
 
 
 def meta_get(k, default=None):
@@ -462,6 +537,8 @@ def prune_state(now_ts=None):
         db().execute("DELETE FROM served_posts WHERE served_at < ?", (now_ts - 30 * 86400,))
         db().execute("DELETE FROM interaction_events WHERE created_at < ?",
                      (now_ts - 30 * 86400,))
+        db().execute("DELETE FROM engagement_snapshots WHERE ts < ?",
+                     (now_ts - int(CFG.get("snapshot_keep_days", 30) or 30) * 86400,))
         db().execute("DELETE FROM user_affinity WHERE updated_at < ?",
                      (now_ts - 60 * 86400,))
         # Per-user exclusion memory. user_likes is a cache of public likes
@@ -594,6 +671,8 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
     window (written back by the caller when the run finishes).
     """
     w = weights_for(fcfg)
+    growth_mult = float((CFG.get("growth") or {}).get(
+        "score_mult", GROWTH_DEFAULTS["score_mult"]))
     rkey = fcfg["rkey"]
     ttl = fcfg.get("seen_ttl_hours", 24)
     owner_did = (owner or {}).get("did")
@@ -639,6 +718,23 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
             # question from the time-window Top feeds; without them every feed
             # is the same ranker with a different max_age_hours. Owner posts
             # bypass them like every other gate.
+            # Language axis: compare primary subtags, so "es-MX" counts as
+            # "es". A require list is strict — a post with no declared language
+            # is unknown, not Spanish, so it does not pass. An exclude list only
+            # drops declarations it can see; it never guesses a missing tag.
+            need_langs = {str(x).lower() for x in (fcfg.get("require_lang") or [])}
+            skip_langs = {str(x).lower() for x in (fcfg.get("exclude_langs") or [])}
+            if need_langs or skip_langs:
+                _r = p.get("record") if isinstance(p.get("record"), dict) else {}
+                _l = _r.get("langs") or []
+                if isinstance(_l, str):
+                    _l = [_l]
+                _prim = {str(x).split("-")[0].lower() for x in _l}
+                if need_langs and not (_prim & need_langs):
+                    continue
+                if skip_langs and (_prim & skip_langs):
+                    continue
+
             need_media = fcfg.get("require_media") or []
             if need_media:
                 _rec = p.get("record") if isinstance(p.get("record"), dict) else {}
@@ -706,7 +802,9 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
             # owner still outrank them; engagement can still carry them onto
             # the board. Chrono ignores it: there is nothing to weight.
             if ranking_mode != "chrono":
-                s = s * p.get("_src_mult", 1.0) + p.get("_src_boost", 0.0)
+                s = (s * p.get("_src_mult", 1.0)
+                     * (growth_mult if p.get("_growth") else 1.0)
+                     + p.get("_src_boost", 0.0))
             gates = []
             if (fcfg.get("min_score") or 0) > 0:
                 gates.append(s >= fcfg["min_score"])
@@ -792,6 +890,206 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
 OWNER_POST_PAGES = 20
 
 
+
+# --------------------------------------------------------------------------
+# pool growth: co-like discovery -> probation -> member or drop
+# --------------------------------------------------------------------------
+# The list is the operator's taste, not a census. Co-like mining asks the
+# community's own signal: which authors do several list members already like,
+# but the list does not contain? Those authors enter on probation — fetched,
+# weighted below members, and promoted or dropped by how their posts do.
+
+GROWTH_DEFAULTS = {
+    "enabled": False,
+    "sample_members": 25,       # list members mined per run
+    "votes_needed": 3,          # distinct members who must like the author
+    "probation_days": 7,
+    "max_probation": 30,        # hard cap on extra author feeds per refresh
+    "promote_min_likes": 3,     # median likes on their posts while on probation
+    "interval_secs": 3600,
+    "like_pages": 1,            # getActorLikes pages (50 each) per sampled member
+    "score_mult": 0.6,          # probation posts rank below list members
+}
+
+
+def growth_cfg():
+    g = dict(GROWTH_DEFAULTS)
+    g.update(CFG.get("growth") or {})
+    return g
+
+
+def _growth_pool_dids():
+    """Authors we already fetch: the list (proxied by recent posts), the owner,
+    and everyone already on probation or promoted."""
+    dids = set()
+    con = db()
+    for (d,) in con.execute("SELECT DISTINCT author_did FROM posts "
+                            "WHERE last_seen > ?", (time.time() - 7 * 86400,)):
+        dids.add(d)
+    for (d,) in con.execute("SELECT author_did FROM growth_members "
+                            "WHERE status IN ('probation','member')"):
+        dids.add(d)
+    owner = (CFG.get("owner") or {}).get("did")
+    if owner:
+        dids.add(owner)
+    dids.update(CFG.get("blocked_dids") or ())
+    return dids
+
+
+def mine_graph(token):
+    """Sample list members, read their public likes, vote for authors.
+
+    Rotation: `sample_members` members per run, chosen by a persisted cursor so
+    a big list is covered over a day rather than the same 25 every hour.
+    """
+    g = growth_cfg()
+    if not g.get("enabled"):
+        return {"mined": 0, "votes": 0, "promoted": 0}
+    now = time.time()
+    if now - float(meta_get("growth_mine_at", 0) or 0) < float(g["interval_secs"]):
+        return {"mined": 0, "votes": 0, "promoted": 0}
+    appview = CFG["source"]["appview_host"]
+    con = db()
+    members = [r[0] for r in con.execute(
+        "SELECT DISTINCT author_did FROM posts WHERE last_seen > ? "
+        "ORDER BY author_did", (now - 7 * 86400,))]
+    if not members:
+        return {"mined": 0, "votes": 0, "promoted": 0}
+    start = int(meta_get("growth_cursor", 0) or 0) % len(members)
+    sample = int(g["sample_members"])
+    # A short list is mined whole; never pad by repeating a member, or the
+    # same voter is counted twice in one run.
+    if len(members) <= sample:
+        batch = members
+    else:
+        batch = members[start:start + sample]
+        if len(batch) < sample:
+            batch += members[:sample - len(batch)]
+    known = _growth_pool_dids()
+    votes = 0
+    failures = 0
+    for voter in batch:
+        if failures >= 3:
+            print(f"[{SVC_TAG}] growth: stopping after {failures} consecutive "
+                  f"graph failures", flush=True)
+            break
+        for page in range(int(g["like_pages"])):
+            q = urllib.parse.urlencode({"actor": voter, "limit": 50})
+            try:
+                # Follows, not likes: app.bsky.feed.getActorLikes answers
+                # "Profile not found" for every actor on the public AppView
+                # (verified 2026-11-04), while getFollows works for any account
+                # and is the same community signal: who do several members
+                # already vouch for by following them.
+                d = rpc(appview, f"app.bsky.graph.getFollows?{q}",
+                        token=token, timeout=15)
+                failures = 0
+            except Exception as e:                      # noqa: BLE001
+                failures += 1
+                print(f"[{SVC_TAG}] growth: getFollows failed for "
+                      f"{voter[:20]}: {str(e)[:90]}", flush=True)
+                break
+            items = d.get("follows") or []
+            if not items:
+                break
+            for it in items:
+                did = it.get("did")
+                if not did or did == voter or did in known:
+                    continue
+                con.execute(
+                    "INSERT INTO growth_votes(author_did, voter_did, "
+                    "author_handle, first_seen, last_seen) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(author_did, voter_did) DO UPDATE SET "
+                    "last_seen=excluded.last_seen, "
+                    "author_handle=excluded.author_handle",
+                    (did, voter, it.get("handle") or "", now, now))
+                votes += 1
+            if not d.get("cursor"):
+                break
+        time.sleep(0.15)
+    meta_set("growth_cursor", start + len(batch))
+    meta_set("growth_mine_at", now)
+
+    promoted = 0
+    for did, handle, n in con.execute(
+            "SELECT author_did, MAX(author_handle), COUNT(DISTINCT voter_did) "
+            "FROM growth_votes GROUP BY author_did HAVING COUNT(DISTINCT voter_did) >= ?",
+            (int(g["votes_needed"]),)).fetchall():
+        if did in known:
+            continue
+        cur = con.execute(
+            "INSERT OR IGNORE INTO growth_members(author_did, handle, status, "
+            "added_at, expires_at, votes, source) VALUES(?,?,?,?,?,?,?)",
+            (did, handle or "", "probation", now,
+             now + float(g["probation_days"]) * 86400, n, "co-like"))
+        promoted += cur.rowcount or 0
+    if votes or promoted:
+        print(f"[{SVC_TAG}] growth: {len(batch)} members mined, {votes} votes, "
+              f"{promoted} new probation", flush=True)
+    return {"mined": len(batch), "votes": votes, "promoted": promoted}
+
+
+def settle_growth(now=None):
+    """Promote probation members whose posts earned likes; drop the rest."""
+    g = growth_cfg()
+    now = now or time.time()
+    con = db()
+    promoted = dropped = 0
+    for did, handle in con.execute(
+            "SELECT author_did, handle FROM growth_members "
+            "WHERE status='probation' AND expires_at < ?", (now,)).fetchall():
+        row = con.execute(
+            "SELECT COUNT(*), AVG(like_count) FROM posts WHERE author_did=? "
+            "AND last_seen > ?", (did, now - 14 * 86400)).fetchone()
+        n, avg = (row[0] or 0), (row[1] or 0)
+        if n and avg >= float(g["promote_min_likes"]):
+            con.execute("UPDATE growth_members SET status='member', "
+                        "expires_at=? WHERE author_did=?",
+                        (now + 60 * 86400, did))
+            promoted += 1
+            print(f"[{SVC_TAG}] growth: promoted {handle or did[:20]} "
+                  f"({n} posts, avg {avg:.1f} likes)", flush=True)
+        else:
+            con.execute("UPDATE growth_members SET status='dropped' "
+                        "WHERE author_did=?", (did,))
+            dropped += 1
+    return {"promoted": promoted, "dropped": dropped}
+
+
+def fetch_growth(token, limit_posts=30):
+    """Fetch recent posts from probation/member authors, tagged `_growth`."""
+    g = growth_cfg()
+    if not g.get("enabled"):
+        return [], {}
+    now = time.time()
+    appview = CFG["source"]["appview_host"]
+    dids = [r[0] for r in db().execute(
+        "SELECT author_did FROM growth_members WHERE status IN ('probation','member') "
+        "AND (status='member' OR expires_at > ?) LIMIT ?", (now, int(g["max_probation"])))]
+    posts, failed = [], 0
+    for did in dids:
+        q = urllib.parse.urlencode({"actor": did, "limit": int(limit_posts)})
+        try:
+            d = rpc(appview, f"app.bsky.feed.getAuthorFeed?{q}",
+                    token=token, timeout=30)
+        except Exception as e:                          # noqa: BLE001
+            failed += 1
+            print(f"[{SVC_TAG}] growth: author feed failed for {did[:20]}: "
+                  f"{str(e)[:80]}", flush=True)
+            continue
+        for it in d.get("feed") or []:
+            if it.get("reason") == "repost":
+                continue
+            p = it.get("post")
+            if not p or not p.get("uri"):
+                continue
+            p["_growth"] = 1
+            posts.append(p)
+        time.sleep(0.1)
+    return posts, {"growth_authors": len(dids), "growth_posts": len(posts),
+                   "growth_failed": failed}
+
+
 def fetch_all(token):
     """One full read pass: list feed + owner posts. Returns (posts, stats)."""
     src = CFG["source"]
@@ -805,6 +1103,21 @@ def fetch_all(token):
     pages = 0
     owner_posts = 0
     by_uri = {}
+
+    # Incremental paging. The list feed is newest-first, so after the first
+    # full crawl most pages carry posts already stored. Stopping after a few
+    # consecutive all-known pages turns a 175-page walk (209 s measured on
+    # leftist) into a short head read, at the cost of not refreshing engagement
+    # counts on deep history every single cycle. `full_crawl_every` forces a
+    # complete walk now and then so old posts' like counts do not fossilise.
+    src_cfg = CFG.get("source") or {}
+    stale_stop = int(src_cfg.get("stale_pages_stop", 2) or 0)
+    full_every = int(src_cfg.get("full_crawl_every", 0) or 0)
+    crawl_count = int(meta_get("crawl_count", 0) or 0) + 1
+    meta_set("crawl_count", crawl_count)
+    incremental = (bool(stale_stop) and bool(CORPUS["by_uri"])
+                   and not (full_every and crawl_count % full_every == 0))
+    stale_pages = 0
 
     cursor = None
     for page in range(200):
@@ -833,6 +1146,26 @@ def fetch_all(token):
             break
         list_items += len(items)
         pages += 1
+        new_in_page = 0
+        if incremental:
+            uris = [(i.get("post") or {}).get("uri") for i in items]
+            uris = [u for u in uris if u]
+            known = set()
+            for c0 in range(0, len(uris), 400):
+                chunk = uris[c0:c0 + 400]
+                qq = ",".join("?" * len(chunk))
+                known.update(r[0] for r in db().execute(
+                    f"SELECT uri FROM posts WHERE uri IN ({qq})", chunk))
+            new_in_page = sum(1 for u in uris if u not in known)
+        if incremental:
+            if new_in_page:
+                stale_pages = 0
+            else:
+                stale_pages += 1
+                if stale_pages >= stale_stop:
+                    print(f"[{SVC_TAG}] list crawl: stopping at page {page} "
+                          f"({stale_pages} pages with nothing new)", flush=True)
+                    break
         for item in items:
             if "reason" in item and item["reason"] != "DIRECT":
                 continue
@@ -1971,7 +2304,7 @@ def seed_cold_start(requester_did):
     return len(counts)
 
 
-def log_metrics(picks_by_feed, feed_scores, now_ts):
+def log_metrics(picks_by_feed, feed_scores, now_ts, stats=None):
     """Append per-feed diversity/freshness/score metrics for this refresh;
     prune rows older than 90 days. Never raises."""
     try:
@@ -2014,16 +2347,299 @@ def log_metrics(picks_by_feed, feed_scores, now_ts):
                          round(_med(ages), 2) if ages else None,
                          round(_med(sc), 2) if sc else None,
                          round(p90, 2) if p90 is not None else None))
+        funnel = {}
+        for rkey, st in (stats or {}).items():
+            prev = db().execute(
+                "SELECT MAX(ts) FROM metrics_log WHERE feed_rkey=?",
+                (rkey,)).fetchone()[0] or 0
+            try:
+                served = db().execute(
+                    "SELECT COUNT(*) FROM served_posts WHERE feed_rkey=? "
+                    "AND served_at > ?", (rkey, prev)).fetchone()[0]
+            except sqlite3.Error:
+                served = 0
+            funnel[rkey] = (int(st.get("in_window", 0) or 0),
+                            int(st.get("pass_gates", 0) or 0),
+                            int(st.get("suppressed", 0) or 0),
+                            len(picks_by_feed.get(rkey) or []),
+                            int(served))
         with DB_LOCK:
             db().executemany(
                 "INSERT OR REPLACE INTO metrics_log(ts, feed_rkey, posts, "
-                "unique_authors, median_age_hours, score_median, score_p90) "
-                "VALUES (?,?,?,?,?,?,?)", rows)
+                "unique_authors, median_age_hours, score_median, score_p90, "
+                "in_window, post_gate, suppressed, final, served) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                [tuple(r) + funnel.get(r[1], (0, 0, 0, 0, 0)) for r in rows])
             db().execute("DELETE FROM metrics_log WHERE ts < ?",
                          (ts - 90 * 86400,))
         print(f"[{SVC_TAG}] metrics logged for {len(rows)} feeds", flush=True)
     except Exception as e:
         print(f"[{SVC_TAG}] metrics failed: {e}", flush=True)
+
+
+def likes_per_1k(days=7, now_ts=None):
+    """Likes earned per 1,000 posts served, per feed, over `days`.
+
+    Attribution rule: a like counts for a feed only when that same requester was
+    served that post by that feed, and the like was observed within 24h of the
+    serve. `interaction_events.created_at` is poll time, not like time, so the
+    window is approximate in the conservative direction.
+    That is deliberately conservative — it under-counts likes that arrive later
+    rather than inventing engagement the feed did not cause.
+
+    Coverage limit: `served_posts` only has rows for requesters whose JWT
+    verified and who were served through the skeleton endpoint, so the rate is
+    a real but partial view. Treat it as a comparison between feeds, not as an
+    absolute engagement figure.
+    """
+    now_ts = time.time() if now_ts is None else now_ts
+    cutoff = now_ts - float(days) * 86400
+    out = {}
+    try:
+        for rk, serves, reqs in db().execute(
+                "SELECT feed_rkey, COUNT(*), COUNT(DISTINCT requester_did) "
+                "FROM served_posts WHERE served_at > ? GROUP BY feed_rkey",
+                (cutoff,)):
+            out[rk] = {"serves": serves, "requesters": reqs, "likes": 0,
+                       "per_1k": 0.0}
+        for rk, likes in db().execute(
+                "SELECT s.feed_rkey, COUNT(DISTINCT e.id) FROM interaction_events e "
+                "JOIN served_posts s ON s.post_uri=e.post_uri "
+                "AND s.requester_did=e.requester_did "
+                "WHERE e.kind='like' AND e.created_at >= ? "
+                "AND e.created_at <= s.served_at + 86400 "
+                "AND e.created_at >= s.served_at "
+                "GROUP BY s.feed_rkey", (cutoff,)):
+            row = out.setdefault(rk, {"serves": 0, "requesters": 0,
+                                      "likes": 0, "per_1k": 0.0})
+            row["likes"] = likes
+        for rk, row in out.items():
+            if row["serves"]:
+                row["per_1k"] = round(1000.0 * row["likes"] / row["serves"], 1)
+    except sqlite3.Error as e:
+        print(f"[{SVC_TAG}] likes_per_1k failed: {e}", flush=True)
+    return out
+
+
+def compact_served(days_keep=30, now_ts=None):
+    """Roll `served_posts` older than `days_keep` into `served_daily`.
+
+    served_posts grows with every serve, forever, and every serve is also the
+    per-user seen memory. The rollup keeps the measurement (serves and distinct
+    requesters per feed per day) and drops the per-row detail once it is older
+    than any feed's hide_seen_ttl_h can reach.
+
+    Returns the number of rows deleted. Idempotent: a second run on the same
+    data adds nothing to served_daily and deletes nothing.
+    """
+    now_ts = time.time() if now_ts is None else now_ts
+    keep_h = max([int(days_keep) * 24] +
+                 [int((f.get("hide_seen_ttl_h") or 0)) for f in CFG.get("feeds") or []])
+    cutoff = now_ts - keep_h * 3600
+    deleted = 0
+    try:
+        with DB_LOCK:
+            db().execute(
+                "INSERT INTO served_daily(feed_rkey, day, serves, requesters) "
+                "SELECT feed_rkey, date(served_at, 'unixepoch'), COUNT(*), "
+                "COUNT(DISTINCT requester_did) FROM served_posts "
+                "WHERE served_at < ? GROUP BY 1, 2 "
+                "ON CONFLICT(feed_rkey, day) DO UPDATE SET "
+                "serves = served_daily.serves + excluded.serves, "
+                "requesters = MAX(served_daily.requesters, excluded.requesters)",
+                (cutoff,))
+            cur = db().execute("DELETE FROM served_posts WHERE served_at < ?", (cutoff,))
+            deleted = cur.rowcount or 0
+    except sqlite3.Error as e:
+        print(f"[{SVC_TAG}] compaction failed: {e}", flush=True)
+        return 0
+    if deleted:
+        print(f"[{SVC_TAG}] compaction: {deleted} served rows rolled up "
+              f"(kept {keep_h // 24}d of detail)", flush=True)
+    return deleted
+
+
+# --------------------------------------------------------------------------
+# taste as a published, signed, followable object
+# --------------------------------------------------------------------------
+# Every instance can publish what it has learned about authors and topics. The
+# file is signed with an Ed25519 key bound to the instance's did:web, so a
+# reader (or another instance) can verify it came from that domain, not just
+# from that URL. Following a taste is explicit and capped: a foreign file can
+# only move local weights by `weight` and only for its top `max_authors`.
+
+TASTE_FILE_VERSION = 1
+
+
+def _b64u(data: bytes) -> str:
+    import base64
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _b64u_dec(text: str) -> bytes:
+    import base64
+    pad = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + pad)
+
+
+def instance_key():
+    """The instance's Ed25519 key. Created on first use, kept in the database
+    so it travels with the state it signs."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    pem = meta_get("instance_key_pem")
+    if pem:
+        return serialization.load_pem_private_key(pem.encode(), password=None)
+    key = Ed25519PrivateKey.generate()
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()).decode()
+    meta_set("instance_key_pem", pem)
+    print(f"[{SVC_TAG}] generated an instance signing key", flush=True)
+    return key
+
+
+def instance_pubkey_b64() -> str:
+    from cryptography.hazmat.primitives import serialization
+    raw = instance_key().public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw)
+    return _b64u(raw)
+
+
+def _taste_canonical(doc: dict) -> bytes:
+    body = {k: v for k, v in doc.items() if k != "signature"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode()
+
+
+def build_taste_file(cfg=None):
+    """The public taste document for this instance (signed)."""
+    cfg = cfg or CFG
+    now = datetime.now(timezone.utc)
+    authors = {}
+    try:
+        rows = db().execute(
+            "SELECT author_did, likes_count FROM taste "
+            "ORDER BY likes_count DESC LIMIT 500").fetchall()
+        top = max([float(n or 0) for _, n in rows] + [1.0])
+        for did, n in rows:
+            authors[did] = round(float(n or 0) / top, 3)
+    except sqlite3.Error:
+        pass
+    topics = {}
+    try:
+        for did, aff in db().execute(
+                "SELECT author_did, affinity FROM author_topic "
+                "ORDER BY ABS(affinity) DESC LIMIT 300"):
+            topics[did] = round(float(aff), 3)
+    except sqlite3.Error:
+        pass
+    doc = {
+        "version": TASTE_FILE_VERSION,
+        "instance": SERVICE_DID,
+        "generatedAt": now.isoformat(),
+        "title": (cfg.get("page") or {}).get("title") or SVC_TAG,
+        "list_uri": (cfg.get("source") or {}).get("list_uri"),
+        "feeds": [{"rkey": f["rkey"], "name": f.get("display_name") or f["rkey"],
+                   "uri": f"at://{cfg.get('publisher_did')}/app.bsky.feed.generator/{f['rkey']}"}
+                  for f in cfg.get("feeds") or []],
+        "authors": authors,
+        "topics": topics,
+        "decay": {"half_life_days": int((cfg.get("tension") or {}).get("half_life_days", 30))},
+    }
+    doc["signature"] = {"alg": "ed25519", "key": instance_pubkey_b64(),
+                        "value": _b64u(instance_key().sign(_taste_canonical(doc)))}
+    return doc
+
+
+def verify_taste_file(doc: dict, pub_b64: str) -> bool:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.exceptions import InvalidSignature
+    sig = (doc.get("signature") or {})
+    if sig.get("alg") != "ed25519" or not sig.get("value"):
+        return False
+    try:
+        key = Ed25519PublicKey.from_public_bytes(_b64u_dec(pub_b64))
+        key.verify(_b64u_dec(sig["value"]), _taste_canonical(doc))
+        return True
+    except (InvalidSignature, ValueError, TypeError):
+        return False
+
+
+def fetch_taste_source(url, timeout=15):
+    """Fetch a taste file and the signer's did:web document, verify, return doc."""
+    import urllib.request
+    # Identify ourselves: several reverse proxies 403 the default Python UA,
+    # and a feed generator fetching another instance is a known client.
+    ua = f"feedgen-taste/1 (+{SERVICE_DID})"
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        doc = json.loads(r.read())
+    origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlparse(url))
+    req = urllib.request.Request(f"{origin}/.well-known/did.json",
+                                 headers={"User-Agent": ua})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        did_doc = json.loads(r.read())
+    pub = None
+    for vm in did_doc.get("verificationMethod") or []:
+        jwk = vm.get("publicKeyJwk") or {}
+        if jwk.get("crv") == "Ed25519" and jwk.get("x"):
+            pub = jwk["x"]
+            break
+    if not pub:
+        raise RuntimeError(f"{url}: no Ed25519 key in {origin}/.well-known/did.json")
+    if not verify_taste_file(doc, pub):
+        raise RuntimeError(f"{url}: signature does not verify")
+    if doc.get("instance") != did_doc.get("id"):
+        raise RuntimeError(f"{url}: taste instance {doc.get('instance')} != did doc {did_doc.get('id')}")
+    return doc
+
+
+def apply_taste_sources(taste: dict, cfg=None, now=None):
+    """Merge followed taste files into a copy of the local taste dict.
+
+    Capped three ways, because a followed curator must never be able to take
+    the board: `weight` scales every foreign value, `max_authors` bounds how
+    many are merged, and values are clipped to [0, 1].
+    """
+    cfg = cfg or CFG
+    now = now or time.time()
+    out = dict(taste)
+    merged = 0
+    for src in cfg.get("taste_sources") or []:
+        url = src.get("url")
+        if not url:
+            continue
+        cache_key = "taste_src:" + url
+        cached = meta_get(cache_key)
+        doc, fetched = None, 0.0
+        if cached:
+            try:
+                blob = json.loads(cached)
+                doc, fetched = blob.get("doc"), float(blob.get("at") or 0)
+            except (ValueError, TypeError):
+                doc = None
+        if doc is None or now - fetched > float(src.get("cache_secs", 3600)):
+            try:
+                doc = fetch_taste_source(url)
+                meta_set(cache_key, json.dumps({"at": now, "doc": doc}))
+            except Exception as e:                       # noqa: BLE001
+                print(f"[{SVC_TAG}] taste source {url} failed: {str(e)[:150]}",
+                      flush=True)
+                continue
+        w = max(0.0, min(1.0, float(src.get("weight", 0.3))))
+        cap = int(src.get("max_authors", 200))
+        items = sorted((doc.get("authors") or {}).items(),
+                       key=lambda kv: -float(kv[1] or 0))[:cap]
+        for did, val in items:
+            out[did] = min(1.0, out.get(did, 0.0) + w * float(val or 0))
+        merged += len(items)
+    if merged:
+        print(f"[{SVC_TAG}] followed taste: {merged} author weights merged",
+              flush=True)
+    return out
 
 
 def inject_explore_slots(ranked, scores, aff, auth, share):
@@ -2252,7 +2868,21 @@ def apply_owner_gravity():
 # refresh
 # --------------------------------------------------------------------------
 
+def run_maintenance():
+    """Interactions -> affinity -> gravity -> requester likes. Idempotent."""
+    poll_interactions()
+    process_interactions()
+    apply_owner_gravity()
+    try:
+        warm = refresh_all_requester_likes()
+        if warm:
+            print(f"[{SVC_TAG}] refreshed likes for {warm} requesters", flush=True)
+    except Exception as e:                            # noqa: BLE001
+        print(f"[{SVC_TAG}] requester-like refresh failed: {e}", flush=True)
+
+
 def refresh():
+    _t_start = time.monotonic()
     # Adaptive keyword weights age continuously: decay them (at most once
     # an hour) so a term the community stopped using fades out.
     if kw_enabled():
@@ -2273,6 +2903,7 @@ def refresh():
 
     now = datetime.now(timezone.utc)
     posts, fstats = fetch_all(token)
+    _t_fetch = time.monotonic()
 
     # Additive sources: external feed generators and authenticated search.
     # Both are config-gated and both only ever ADD candidates; a failure is
@@ -2295,11 +2926,43 @@ def refresh():
         fstats[label] = added
         fstats[label + "_detail"] = est
 
+    try:
+        mine_graph(token)
+    except Exception as e:                            # noqa: BLE001
+        print(f"[{SVC_TAG}] co-like mining failed: {e}", flush=True)
+    try:
+        gposts, gstats = fetch_growth(token)
+        added = 0
+        for p in gposts:
+            uri = p.get("uri")
+            if uri and uri not in have:
+                have.add(uri)
+                posts.append(p)
+                added += 1
+        fstats.update(gstats)
+        fstats["growth_added"] = added
+    except Exception as e:                            # noqa: BLE001
+        print(f"[{SVC_TAG}] growth fetch failed: {e}", flush=True)
+    try:
+        settle_growth()
+    except Exception as e:                            # noqa: BLE001
+        print(f"[{SVC_TAG}] growth settle failed: {e}", flush=True)
+
     record_posts(posts)
     snapshot_engagements(posts)
+    fetched = len(posts)
+    _max_window = max(f.get("max_age_hours", 48) for f in CFG["feeds"])
+    posts = merge_corpus(posts, _max_window)
+    fstats["corpus"] = len(posts)
+    fstats["fetched"] = fetched
+    _t_ingest = time.monotonic()
 
     topic_affinity, topic_seeds = build_topic_affinity()
     taste = build_taste(token)
+    try:
+        taste = apply_taste_sources(taste)
+    except Exception as e:                            # noqa: BLE001
+        print(f"[{SVC_TAG}] taste sources failed: {e}", flush=True)
     try:
         build_taste_ext()
     except Exception as e:
@@ -2322,10 +2985,22 @@ def refresh():
             print(f"[{SVC_TAG}] owner-liked set unavailable: {e}", flush=True)
     ctx["owner_liked"] = owner_liked
 
+    _t_rank0 = time.monotonic()
     picks, stats, feed_scores = {}, {}, {}
+    prev_feeds = dict(CACHE.get("feeds") or {})
+    prev_stats = dict(CACHE.get("stats") or {})
     shown = []
     now_ts = time.time()
     for f in CFG["feeds"]:
+        every = int(f.get("rank_every_secs", 0) or 0)
+        if every and now_ts - FEED_RANKED_AT.get(f["rkey"], 0) < every:
+            # Reuse the board computed last time. Short-window feeds keep
+            # ranking every cycle; archives stop multiplying the cycle cost.
+            picks[f["rkey"]] = list(prev_feeds.get(f["rkey"]) or [])
+            stats[f["rkey"]] = dict(prev_stats.get(f["rkey"]) or {}) | {"skipped": 1}
+            feed_scores[f["rkey"]] = dict((CACHE.get("feed_scores") or {}).get(f["rkey"]) or {})
+            continue
+        FEED_RANKED_AT[f["rkey"]] = now_ts
         ttl = f.get("seen_ttl_hours", 24)
         suppressed = set()
         if ttl:
@@ -2353,18 +3028,18 @@ def refresh():
             by_rkey.setdefault(r, []).append(u)
         for r, uris in by_rkey.items():
             mark_seen(r, uris, now_ts)
+    if now_ts - float(meta_get("served_compacted_at", 0) or 0) > 86400:
+        compact_served(int(CFG.get("served_keep_days", 30) or 30), now_ts)
+        meta_set("served_compacted_at", now_ts)
     prune_state(now_ts)
 
-    # personalization pipeline: observe -> fold -> daily owner-taste drift
-    poll_interactions()
-    process_interactions()
-    apply_owner_gravity()
-    try:
-        warm = refresh_all_requester_likes()
-        if warm:
-            print(f"[{SVC_TAG}] refreshed likes for {warm} requesters", flush=True)
-    except Exception as e:
-        print(f"[{SVC_TAG}] requester-like refresh failed: {e}", flush=True)
+    _t_rank = time.monotonic()
+    # Personalization pipeline. Network-bound (polling interactions for served
+    # posts) so it no longer sits between ranking and the next ingest: a systemd
+    # timer runs maintenance.py, and this branch is only a fallback for
+    # deployments that have not switched it on.
+    if CFG.get("maintenance_in_service", True):
+        run_maintenance()
 
     meta_set("last_refresh", now_ts)
     with CACHE_LOCK:
@@ -2382,11 +3057,19 @@ def refresh():
             "author_priors": dict(priors),
             "topic_keywords": ctx["topic_keywords"],
         }
-    log_metrics(CACHE["feeds"], CACHE.get("feed_scores") or {}, time.time())
+    log_metrics(CACHE["feeds"], CACHE.get("feed_scores") or {}, time.time(),
+                stats=stats)
     fstats["state_uris"] = total_seen
     fstats["taste_authors"] = len(taste)
     fstats["topic_authors"] = len(topic_affinity)
     fstats["posts_stored"] = len(posts)
+    _t_end = time.monotonic()
+    print(f"[{SVC_TAG}] phases: fetch={_t_fetch - _t_start:.1f}s "
+          f"ingest={_t_ingest - _t_fetch:.1f}s "
+          f"taste+gates={_t_rank0 - _t_ingest:.1f}s "
+          f"rank={_t_rank - _t_rank0:.1f}s "
+          f"maintenance={_t_end - _t_rank:.1f}s "
+          f"total={_t_end - _t_start:.1f}s", flush=True)
     return picks, stats, fstats
 
 
@@ -3068,19 +3751,27 @@ def render_status_page(snap, cfg):
     except sqlite3.Error:
         rq24 = rqall = 0
     mrows = ""
+    eng = likes_per_1k(7)
     try:
-        for rk, n, ua, ma, sm, sp in db().execute(
+        for rk, n, ua, ma, sm, sp, iw, pg, su, fi, se in db().execute(
                 "SELECT feed_rkey, posts, unique_authors, "
-                "median_age_hours, score_median, score_p90 FROM "
+                "median_age_hours, score_median, score_p90, "
+                "in_window, post_gate, suppressed, final, served FROM "
                 "metrics_log WHERE ts=(SELECT MAX(ts) FROM metrics_log)"):
+            e = eng.get(rk) or {}
             mrows += (f"<tr><td>{rk}</td><td>{n}</td><td>{ua}</td>"
-                      f"<td>{ma}</td><td>{sm}</td><td>{sp}</td></tr>")
+                      f"<td>{ma}</td><td>{sm}</td><td>{sp}</td>"
+                      f"<td>{iw}</td><td>{pg}</td><td>{su}</td><td>{fi}</td>"
+                      f"<td>{se}</td><td>{e.get('likes', 0)}</td>"
+                      f"<td>{e.get('per_1k', 0.0)}</td></tr>")
     except sqlite3.Error:
         pass
     metrics_html = (f"<h2>metrics (latest refresh)</h2><table border=1>"
                     f"<tr><th>feed</th><th>posts</th><th>unique authors</th>"
                     f"<th>median age h</th><th>score median</th>"
-                    f"<th>score p90</th></tr>{mrows}</table>")
+                    f"<th>score p90</th><th>in_window</th><th>post_gate</th>"
+                    f"<th>suppressed</th><th>final</th><th>served</th>"
+                    f"<th>likes 7d</th><th>likes/1k</th></tr>{mrows}</table>")
     out = (
         f"{metrics_html}"
         f"<h1>Top-posts feeds</h1><ul>{rows}</ul>"
@@ -3133,9 +3824,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {
                 "@context": ["https://www.w3.org/ns/did/v1"],
                 "id": SERVICE_DID,
+                "verificationMethod": [{
+                    "id": f"{SERVICE_DID}#atproto",
+                    "type": "JsonWebKey2020",
+                    "controller": SERVICE_DID,
+                    "publicKeyJwk": {"kty": "OKP", "crv": "Ed25519",
+                                     "x": instance_pubkey_b64()},
+                }],
                 "service": [{"id": "#bsky_fg", "type": "BskyFeedGenerator",
                              "serviceEndpoint": f"https://{HOSTNAME}"}],
             })
+
+        if u.path == "/.well-known/taste.json":
+            return self._send(200, build_taste_file(CFG))
 
         if u.path == "/xrpc/app.bsky.feed.describeFeedGenerator":
             return self._send(200, {"did": SERVICE_DID,
@@ -3406,6 +4107,17 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path in ("/guide", "/guia"):
             return self._send(200, render_guide_page(CFG), "text/html")
+
+        if u.path == "/metrics.json":
+            try:
+                days = float((q.get("days") or ["7"])[0])
+            except ValueError:
+                days = 7.0
+            out = {"days": days, "feeds": likes_per_1k(days)}
+            with CACHE_LOCK:
+                out["boards"] = {k: len(v) for k, v in CACHE["feeds"].items()}
+                out["updated"] = CACHE.get("updated")
+            return self._send(200, out)
 
         if u.path == "/quiz":
             return self._send(200, render_quiz_page(CFG), "text/html")
