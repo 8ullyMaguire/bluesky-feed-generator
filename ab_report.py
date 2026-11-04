@@ -48,6 +48,16 @@ def collect(days=7.0):
             boards = {k: len(v) for k, v in (fg.CACHE.get("feeds") or {}).items()}
     except Exception:                                  # noqa: BLE001
         boards = {}
+    # A standalone run has no in-memory cache; the last metrics row is the
+    # board the service last built, so the table stays useful from a shell.
+    if not boards:
+        try:
+            for rk, n in fg.db().execute(
+                    "SELECT feed_rkey, posts FROM metrics_log "
+                    "WHERE ts=(SELECT MAX(ts) FROM metrics_log)"):
+                boards[rk] = n
+        except Exception:                              # noqa: BLE001
+            pass
     rows = []
     for f in fg.CFG.get("feeds") or []:
         rk = f["rkey"]
