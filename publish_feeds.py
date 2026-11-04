@@ -37,17 +37,43 @@ def load_dotenv(path):
     return vals
 
 
-CFG = json.load(open(os.environ.get("FEEDGEN_CONFIG")
-                     or os.path.join(BASE, "config.json")))
+CFG_PATH = (os.environ.get("FEEDGEN_CONFIG")
+            or os.path.join(BASE, "config.json"))
+CFG = json.load(open(CFG_PATH))
+# The deployment's own .env must win: the script lives in the shared engine, so
+# a steeltitan run that picked up ~/feedgen/.env would publish with the wrong
+# account (and be rejected as a foreign repo, after confusing the operator).
 ENV = {}
-for p in (os.path.join(BASE, ".env"), os.path.expanduser("~/feedgen/.env"),
+for p in (os.path.join(os.path.dirname(os.path.abspath(CFG_PATH)), ".env"),
+          os.path.join(BASE, ".env"), os.path.expanduser("~/feedgen/.env"),
           os.path.expanduser("~/.hermes/.env")):
+    # dict | dict keeps the LEFT operand's keys: the first file loaded wins, so
+    # the deployment's own .env is first.
     ENV = load_dotenv(p) | ENV
 ENV |= dict(os.environ)
 
-PDS = CFG["source"]["pds_host"]
+def resolve_pds(did):
+    """The account's real PDS endpoint, or None.
+
+    Writes must go to the PDS that actually hosts the repo: steeltitan lives on
+    a separate bsky.network shard, and posting its records to the config's
+    default host fails with `AccountNotFound` even though reads work.
+    """
+    try:
+        with urllib.request.urlopen(f"https://plc.directory/{did}", timeout=20) as r:
+            doc = json.load(r)
+        for svc in doc.get("service") or []:
+            if svc.get("id") in ("#atproto_pds", "atproto_pds"):
+                return (svc.get("serviceEndpoint") or "").rstrip("/") or None
+    except Exception as e:                            # noqa: BLE001
+        print(f"[publish] could not resolve the PDS for {did}: {e}")
+    return None
+
+
+PDS = CFG["source"]["pds_host"]  # rebound below, after REPO is known
 APPVIEW = CFG["source"]["appview_host"]
 REPO = CFG["publisher_did"]
+PDS = resolve_pds(REPO) or PDS
 SERVICE_DID = f"did:web:{CFG['hostname']}"
 
 
@@ -74,7 +100,9 @@ def existing(token):
                                     "limit": 100})
         d = rpc(PDS, f"com.atproto.repo.listRecords?{q}", token=token)
         for r in d.get("records", []):
-            out[r["uri"].rsplit("/", 1)[-1]] = r.get("value") or {}
+            out[r["uri"].rsplit("/", 1)[-1]] = {
+                "uri": r.get("uri"), "cid": r.get("cid"),
+                "value": r.get("value") or {}}
     except Exception as e:
         print(f"[publish] could not list existing records: {e}")
     return out
@@ -101,26 +129,35 @@ def main(argv):
                   f"the PDS caps generator descriptions at 300 graphemes",
                   file=sys.stderr)
             return 2
-        want = {
+        cur = have.get(rkey) or {}
+        cur_val = dict(cur.get("value") or {})
+        want = cur_val | {
             "$type": "app.bsky.feed.generator",
             "did": SERVICE_DID,
             "displayName": f["display_name"],
             "description": f["description"][:3000],
-            "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            # Declared here, not only in describeFeedGenerator: the client reads
+            # the RECORD to decide whether to offer "show more/less like this".
+            "acceptsInteractions": True,
+            "createdAt": cur_val.get("createdAt")
+            or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         }
-        cur = have.get(rkey)
-        if cur and not force and cur.get("displayName") == want["displayName"] \
-                and cur.get("description") == want["description"]:
+        if cur_val and not force \
+                and cur_val.get("displayName") == want["displayName"] \
+                and cur_val.get("description") == want["description"] \
+                and cur_val.get("acceptsInteractions") is True:
             print(f"  = {rkey:<18} unchanged")
             continue
         if dry:
-            print(f"  DRY {'update' if cur else 'create'} {rkey:<18} "
+            print(f"  DRY {'update' if cur_val else 'create'} {rkey:<18} "
                   f"{f['display_name']!r}")
             continue
+        body = {"repo": REPO, "collection": "app.bsky.feed.generator",
+                "rkey": rkey, "record": want}
+        if cur.get("cid"):
+            body["swapRecord"] = cur["cid"]
         try:
-            rpc(PDS, "com.atproto.repo.putRecord", {
-                "repo": REPO, "collection": "app.bsky.feed.generator",
-                "rkey": rkey, "record": want}, token)
+            rpc(PDS, "com.atproto.repo.putRecord", body, token)
             changed += 1
             print(f"  + {rkey:<18} {'updated' if cur else 'created'} "
                   f"{f['display_name']!r}")

@@ -537,9 +537,14 @@ def rank_score(p, fcfg, w, age_h, ctx):
 
         log_engagement * author_prior * taste/keyword multipliers * velocity
     """
+    mode = fcfg.get("ranking", "flat")
+    if mode == "chrono":
+        # "What just happened": newest first, no engagement and no taste.
+        # A timeline feed, not a ranked one.
+        return -age_h
     s = ranking_core.log_engagement(p, w)
     did = (p.get("author") or {}).get("did") or "?"
-    mode = fcfg.get("ranking", "flat")
+
     topicw = fcfg.get("topic_weight", 0.0)
     taw = fcfg.get("taste_weight", 0.0)
 
@@ -630,6 +635,22 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
 
         # --- owner posts bypass every gate, including suppression ---
         if not is_owner:
+            # Selective axes. Each of these makes a feed answer a DIFFERENT
+            # question from the time-window Top feeds; without them every feed
+            # is the same ranker with a different max_age_hours. Owner posts
+            # bypass them like every other gate.
+            need_media = fcfg.get("require_media") or []
+            if need_media:
+                _rec = p.get("record") if isinstance(p.get("record"), dict) else {}
+                _emb = _rec.get("embed") if isinstance(_rec.get("embed"), dict) else {}
+                if _emb.get("$type") not in need_media:
+                    continue
+            if fcfg.get("min_replies"):
+                if int(p.get("replyCount") or 0) < int(fcfg["min_replies"]):
+                    continue
+            if fcfg.get("require_owner_liked"):
+                if p.get("uri") not in (ctx.get("owner_liked") or ()):
+                    continue
             # Adaptive gates: automatically adjust thresholds to maintain
             # target number of non-owner posts (adaptive_target)
             target = fcfg.get("adaptive_target", int(fcfg.get("max_posts", 100) * 0.75))
@@ -683,8 +704,9 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
             # Source weighting: posts contributed by an external feed or a
             # search term carry a multiplier below 1.0 so list members and the
             # owner still outrank them; engagement can still carry them onto
-            # the board.
-            s = s * p.get("_src_mult", 1.0) + p.get("_src_boost", 0.0)
+            # the board. Chrono ignores it: there is nothing to weight.
+            if ranking_mode != "chrono":
+                s = s * p.get("_src_mult", 1.0) + p.get("_src_boost", 0.0)
             gates = []
             if (fcfg.get("min_score") or 0) > 0:
                 gates.append(s >= fcfg["min_score"])
@@ -703,7 +725,8 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
                 continue
         else:
             s = rank_score(p, fcfg, w, age_h, ctx)
-            s = s * owner.get("boost", 1.0) + owner.get("bonus", 0.0)
+            if ranking_mode != "chrono":
+                s = s * owner.get("boost", 1.0) + owner.get("bonus", 0.0)
             stats["owner"] += 1
             stats["pass_share"] += 1
             stats["pass_gates"] += 1
@@ -2289,6 +2312,16 @@ def refresh():
     }
 
     owner = CFG.get("owner", {})
+    owner_liked = set()
+    if owner.get("did"):
+        try:
+            owner_liked = {r[0] for r in db().execute(
+                "SELECT post_uri FROM user_likes WHERE requester_did=?",
+                (owner["did"],))}
+        except Exception as e:                        # noqa: BLE001
+            print(f"[{SVC_TAG}] owner-liked set unavailable: {e}", flush=True)
+    ctx["owner_liked"] = owner_liked
+
     picks, stats, feed_scores = {}, {}, {}
     shown = []
     now_ts = time.time()
