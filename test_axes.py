@@ -45,11 +45,13 @@ def ok(cond, label):
     checks += 1
 
 
-def mkpost(uri, hours, likes=0, replies=0, embed=None):
+def mkpost(uri, hours, likes=0, replies=0, embed=None, langs=None):
     ts = (NOW - timedelta(hours=hours)).isoformat()
     rec = {"text": "t", "createdAt": ts}
     if embed:
         rec["embed"] = {"$type": embed}
+    if langs:
+        rec["langs"] = langs
     return {"uri": uri, "cid": "c", "indexedAt": ts,
             "author": {"did": "did:plc:" + uri.split("/")[-1], "handle": "h"},
             "record": rec, "likeCount": likes, "repostCount": 0,
@@ -110,8 +112,23 @@ ok(order == ["at://did:plc:i/app.bsky.feed.post/9"],
 ok(uris(dict(BASE, require_owner_liked=True), [liked, not_liked], CTX) == [],
    "an empty owner_liked set hides the feed's whole pool rather than ignoring the flag")
 
+# ---- language axis
+es_post = mkpost("at://did:plc:k/app.bsky.feed.post/11", hours=1, likes=1, langs=["es-MX"])
+ca_post = mkpost("at://did:plc:l/app.bsky.feed.post/12", hours=1, likes=1, langs=["ca"])
+en_post = mkpost("at://did:plc:m/app.bsky.feed.post/13", hours=1, likes=1, langs=["en"])
+none_post = mkpost("at://did:plc:n/app.bsky.feed.post/14", hours=1, likes=1)
+order = uris(dict(BASE, require_lang=["es", "ca", "gl"]),
+             [es_post, ca_post, en_post, none_post])
+ok(set(order) == {"at://did:plc:k/app.bsky.feed.post/11",
+                  "at://did:plc:l/app.bsky.feed.post/12"},
+   "require_lang matches primary subtags and drops untagged posts")
+order = uris(dict(BASE, exclude_langs=["en"]),
+             [es_post, ca_post, en_post, none_post])
+ok(len(order) == 3 and "at://did:plc:m/app.bsky.feed.post/13" not in order,
+   "exclude_langs drops only declared matches, keeps untagged posts")
+
 # ---- the axes are opt-in: an unconfigured feed keeps every post
-order = uris(BASE, [quiet, talked, pictured, text_only])
-ok(len(order) == 4, "no axis configured means no filtering")
+order = uris(BASE, [quiet, talked, pictured, text_only, es_post, none_post])
+ok(len(order) == 6, "no axis configured means no filtering")
 
 print(f"ALL AXES CHECKS PASSED ({checks} assertions)")
