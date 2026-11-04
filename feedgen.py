@@ -680,6 +680,11 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
                 s = rank_score(p, fcfg, w, age_h, ctx)
                 if uri:
                     track[uri] = "fresh"
+            # Source weighting: posts contributed by an external feed or a
+            # search term carry a multiplier below 1.0 so list members and the
+            # owner still outrank them; engagement can still carry them onto
+            # the board.
+            s = s * p.get("_src_mult", 1.0) + p.get("_src_boost", 0.0)
             gates = []
             if (fcfg.get("min_score") or 0) > 0:
                 gates.append(s >= fcfg["min_score"])
@@ -847,6 +852,165 @@ def fetch_all(token):
     return list(by_uri.values()), {
         "list_items": list_items, "pages": pages, "owner_posts": owner_posts,
     }
+
+
+# --------------------------------------------------------------------------
+# extra sources (config-gated): external feed generators + authenticated search
+# --------------------------------------------------------------------------
+#
+# Both sources exist because the list alone is a small pool. They are purely
+# additive: nothing here runs unless the matching config block is present, and
+# every post they contribute is tagged so select() can weight it below list
+# members and the owner (a source multiplier, not a ban).
+#
+# Cadence is per source and tracked in `meta`, so a restart does not reset it
+# and a slow source cannot make refresh() slower than the source it waits on.
+
+
+def _src_due(key, interval):
+    """True when a source is due, given its own interval in seconds."""
+    try:
+        interval = float(interval or 0)
+    except (TypeError, ValueError):
+        interval = 0.0
+    if interval <= 0:
+        return True
+    try:
+        last = float(meta_get(f"src_last:{key}", 0) or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    return (time.time() - last) >= interval
+
+
+def _src_mark(key):
+    meta_set(f"src_last:{key}", time.time())
+
+
+def mark_seen(rkey, uris, now_ts=None):
+    """Write this feed's suppression rows for `uris` (bounded, keyed by rkey)."""
+    uris = [u for u in uris if u]
+    if not uris:
+        return 0
+    now_ts = time.time() if now_ts is None else now_ts
+    with DB_LOCK:
+        db().executemany(
+            """INSERT INTO seen(rkey,uri,shown_at,shown_count) VALUES(?,?,?,1)
+               ON CONFLICT(rkey,uri) DO UPDATE SET
+                 shown_at=excluded.shown_at,
+                 shown_count=seen.shown_count+1""",
+            [(rkey, u, now_ts) for u in uris])
+    return len(uris)
+
+
+def fetch_ext_feeds():
+    """External community feeds (config `ext_feeds`).
+
+    Each entry is {name, uri, endpoint, limit, score_mult, boost,
+    interval_secs}. `getFeedSkeleton` is served by the GENERATOR's own
+    endpoint, never by the AppView, so the endpoint is pinned in config
+    (references/host-matrix.md). Failures are logged and never fatal: one dead
+    community feed must not cost a refresh.
+    """
+    entries = CFG.get("ext_feeds") or []
+    if not entries:
+        return [], {}
+    out, stats = [], {}
+    for e in entries:
+        name = e.get("name") or e.get("uri", "?")
+        if not _src_due(f"ext:{name}", e.get("interval_secs", 300)):
+            stats[name] = "skipped"
+            continue
+        try:
+            limit = max(1, min(100, int(e.get("limit", 60))))
+            q = urllib.parse.urlencode({"feed": e["uri"], "limit": limit})
+            skel = rpc(e["endpoint"], f"app.bsky.feed.getFeedSkeleton?{q}", timeout=30)
+            uris = [it.get("post") for it in skel.get("feed", []) if it.get("post")]
+            posts = []
+            for i in range(0, len(uris), 25):
+                qq = "&".join("uris=" + urllib.parse.quote(u, safe="")
+                              for u in uris[i:i + 25])
+                d = rpc(CFG["source"]["appview_host"],
+                        f"app.bsky.feed.getPosts?{qq}", timeout=30)
+                posts.extend(d.get("posts", []))
+                time.sleep(0.1)
+            mult = float(e.get("score_mult", 1.0))
+            add = float(e.get("boost", 0.0) or 0.0)
+            for p in posts:
+                p["_extfeed_src"] = name
+                p["_src_mult"] = mult
+                p["_src_boost"] = add
+            out.extend(posts)
+            stats[name] = len(posts)
+            _src_mark(f"ext:{name}")
+            print(f"[{SVC_TAG}] ext_feed {name}: {len(posts)} posts", flush=True)
+        except Exception as ex:                       # noqa: BLE001
+            stats[name] = -1
+            print(f"[{SVC_TAG}] ext_feed {name} failed: {ex}", flush=True)
+        time.sleep(0.2)
+    return out, stats
+
+
+def fetch_search_posts(token=None):
+    """Authenticated full-text search as a discovery source.
+
+    `app.bsky.feed.searchPosts` answers 403 on public.api.bsky.app; the
+    account's own PDS serves it when the request carries a session token, so
+    this path authenticates exactly like refresh() does. Results are tagged
+    `_search_src=<term>` and scored with the source multiplier.
+    """
+    sc = CFG.get("search_source") or {}
+    if not sc.get("enabled"):
+        return [], {}
+    terms = [t for t in (sc.get("terms") or []) if str(t).strip()]
+    if not terms:
+        return [], {}
+    if not _src_due("search", sc.get("interval_secs", 600)):
+        return [], {"skipped": True}
+    host = (sc.get("host")
+            or (CFG.get("source") or {}).get("pds_host")
+            or "https://bsky.social")
+    pages = max(1, min(5, int(sc.get("pages", 1))))
+    limit = max(1, min(100, int(sc.get("limit", 100))))
+    max_age_h = float(sc.get("max_age_hours", 72))
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_h)).isoformat()
+    mult = float(sc.get("score_mult", 1.0))
+    add = float(sc.get("boost", 0.0) or 0.0)
+    out, hit = [], {}
+    for term in terms:
+        cursor = None
+        n = 0
+        for _ in range(pages):
+            q = {"q": term, "limit": limit, "sort": sc.get("sort", "latest")}
+            if cursor:
+                q["cursor"] = cursor
+            try:
+                d = rpc(host, "app.bsky.feed.searchPosts?"
+                        + urllib.parse.urlencode(q), token=token, timeout=45)
+            except Exception as ex:                   # noqa: BLE001
+                print(f"[{SVC_TAG}] search '{term}' failed: {ex}", flush=True)
+                break
+            items = d.get("posts") or []
+            if not items:
+                break
+            for p in items:
+                ts = p.get("indexedAt") or (p.get("record") or {}).get("createdAt")
+                if not ts or ts < cutoff:
+                    continue
+                p["_search_src"] = term
+                p["_src_mult"] = mult
+                p["_src_boost"] = add
+                out.append(p)
+                n += 1
+            cursor = d.get("cursor")
+            if not cursor:
+                break
+            time.sleep(0.2)
+        hit[term] = n
+        time.sleep(0.2)
+    _src_mark("search")
+    print(f"[{SVC_TAG}] search_source: {sum(hit.values())} posts from "
+          f"{len(hit)} terms", flush=True)
+    return out, hit
 
 
 def record_posts(posts):
@@ -2086,6 +2250,28 @@ def refresh():
 
     now = datetime.now(timezone.utc)
     posts, fstats = fetch_all(token)
+
+    # Additive sources: external feed generators and authenticated search.
+    # Both are config-gated and both only ever ADD candidates; a failure is
+    # reported in the fstats detail and never costs the refresh.
+    have = {p.get("uri") for p in posts if p.get("uri")}
+    for label, fn in (("ext_feeds", fetch_ext_feeds),
+                      ("search_source", lambda: fetch_search_posts(token))):
+        try:
+            extra, est = fn()
+        except Exception as e:                        # noqa: BLE001
+            print(f"[{SVC_TAG}] {label} failed: {e}", flush=True)
+            continue
+        added = 0
+        for p in extra:
+            uri = p.get("uri")
+            if uri and uri not in have:
+                have.add(uri)
+                posts.append(p)
+                added += 1
+        fstats[label] = added
+        fstats[label + "_detail"] = est
+
     record_posts(posts)
     snapshot_engagements(posts)
 
@@ -2120,14 +2306,20 @@ def refresh():
         stats[f["rkey"]] = st | {"suppressed_set": len(suppressed), "ttl": ttl}
         shown.extend((f["rkey"], u) for u in picks[f["rkey"]])
 
-    if shown:
-        with DB_LOCK:
-            db().executemany(
-                """INSERT INTO seen(rkey,uri,shown_at,shown_count) VALUES(?,?,?,1)
-                   ON CONFLICT(rkey,uri) DO UPDATE SET
-                     shown_at=excluded.shown_at,
-                     shown_count=seen.shown_count+1""",
-                [(r, u, now_ts) for r, u in shown])
+    # `seen` is the per-feed suppression window. Writing the whole computed
+    # board back here (the historical behaviour, kept as the default) makes
+    # refresh frequency itself the limiter: every board removes itself from
+    # the candidate pool for seen_ttl_hours. `seen_mark: "serve"` writes only
+    # when an anonymous page is actually served; `seen_mark: "off"` keeps the
+    # board stable and leaves per-user freshness to served_posts, which is
+    # already per-requester.
+    seen_mode = str(CFG.get("seen_mark", "refresh")).lower()
+    if shown and seen_mode == "refresh":
+        by_rkey = {}
+        for r, u in shown:
+            by_rkey.setdefault(r, []).append(u)
+        for r, uris in by_rkey.items():
+            mark_seen(r, uris, now_ts)
     prune_state(now_ts)
 
     # personalization pipeline: observe -> fold -> daily owner-taste drift
@@ -2916,6 +3108,10 @@ class Handler(BaseHTTPRequestHandler):
 
             if requester_did and page:
                 log_served_posts(requester_did, rkey, page)
+            elif page and str(CFG.get("seen_mark", "refresh")).lower() == "serve":
+                # No identity: served_posts cannot remember this reader, so the
+                # per-feed window is the only anti-repeat memory available.
+                mark_seen(rkey, page)
 
             items = []
             for p in page:
