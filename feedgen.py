@@ -2451,6 +2451,7 @@ PAGE_DEFAULTS = {
     "feeds_title": "The feeds, one by one",
     "faq_title": "Questions",
     "faq": [],
+    "guide": None,                  # long-form how-to, rendered at /guide
     "community_title": "Other community feeds",
     "community_feeds": [],
     "labels": {
@@ -2462,6 +2463,7 @@ PAGE_DEFAULTS = {
         "star_link": "Star on GitHub",
         "note": "These are independent third-party custom feeds. "
                 "Bluesky does not operate or endorse them.",
+        "guide_link": "Guide",
     },
     "show_descriptions": True,
     "credits": "",
@@ -2552,6 +2554,17 @@ th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid rgba(
 a { color: #d7ff3f; }
 code { opacity: .8; }
 .empty { opacity: .65; font-style: italic; }
+.back { margin: 0 0 .8rem; font-size: .88rem; }
+.toc { border: 1px solid rgba(236,231,223,.18); border-radius: .55rem;
+       padding: .8rem 1rem; margin: 1.4rem 0; }
+.toc ol { margin: .35rem 0 0 1.2rem; padding: 0; }
+.toc li { margin: .18rem 0; }
+ol.steps li, ul.bullets li { margin: .4rem 0; }
+pre { background: rgba(236,231,223,.07); border-radius: .5rem; padding: .85rem;
+      overflow-x: auto; font-size: .84rem; line-height: 1.45; }
+pre code { opacity: 1; }
+section > h2 { border-top: 1px solid rgba(236,231,223,.12); padding-top: 1.5rem;
+               margin-top: 2.4rem; }
 """
 
 
@@ -2827,6 +2840,7 @@ def render_index_page(cfg):
     if page["repo"]:
         links.append(f'<a href="{e(page["repo"])}">{e(labels["repo_link"])}</a>')
     links.append(f'<a href="/status">{e(labels["status_link"])}</a>')
+    links.append(f'<a href="/guide">{e(labels["guide_link"])}</a>')
     links.append('<a href="/stats">Estadisticas</a>')
     links.append('<a href="/quiz">Quiz</a>')
     footer.append("<p>" + " · ".join(links) + "</p>")
@@ -2866,6 +2880,56 @@ para ordenar lo que ves, igual que el For You de Bluesky.</p>
 </html>"""
     return doc.encode()
 
+
+def render_guide_page(cfg):
+    """/guide: the long-form how-to, written for someone who has never run a
+    server. Content lives in config (`page.guide`), so each deployment writes it
+    in its own language and links its own repository.
+
+    Structure per section: id, h, p[], steps[], bullets[], code, table[]. Every
+    value is escaped; nothing here is interpolated unescaped into HTML.
+    """
+    e = html.escape
+    guide = (page_cfg(cfg).get("guide") or {})
+    sections = guide.get("sections") or []
+    if not sections:
+        return _page("Guide",
+                     "<h1>Guide</h1><p class=\'empty\'>No guide is configured "
+                     "for this deployment yet.</p>",
+                     "Written in config: page.guide.")
+    toc, parts = [], []
+    for i, s in enumerate(sections):
+        sid = s.get("id") or f"s{i}"
+        toc.append(f'<li><a href="#{e(sid)}">{e(s.get("h") or sid)}</a></li>')
+        parts.append(f'<section id="{e(sid)}">')
+        parts.append(f'<h2>{e(s.get("h") or "")}</h2>')
+        for p in s.get("p") or []:
+            parts.append(f"<p>{e(p)}</p>")
+        if s.get("steps"):
+            parts.append('<ol class="steps">'
+                         + "".join(f"<li>{e(x)}</li>" for x in s["steps"])
+                         + "</ol>")
+        if s.get("bullets"):
+            parts.append('<ul class="bullets">'
+                         + "".join(f"<li>{e(x)}</li>" for x in s["bullets"])
+                         + "</ul>")
+        if s.get("code"):
+            parts.append(f"<pre><code>{e(s['code'])}</code></pre>")
+        if s.get("table"):
+            rows = "".join(f"<tr><td>{e(r[0])}</td><td>{e(r[1])}</td></tr>"
+                           for r in s["table"])
+            parts.append(f"<table>{rows}</table>")
+        parts.append("</section>")
+    back = (f'<p class="back"><a href="/">{e(guide.get("back") or "←")}</a></p>'
+            if guide.get("back") is not None else "")
+    body = (back
+            + f'<h1>{e(guide.get("title") or "Guide")}</h1>'
+            f'<p class="lede">{e(guide.get("lede") or "")}</p>'
+            f'<p class="lede">{e(guide.get("lede") or "")}</p>'
+            f'<nav class="toc"><b>{e(guide.get("toc_title") or "Contents")}</b>'
+            f'<ol>{"".join(toc)}</ol></nav>'
+            + "".join(parts))
+    return _page(guide.get("title") or "Guide", body, guide.get("note") or "")
 
 
 def visitor_key(headers_obj):
@@ -3339,6 +3403,9 @@ class Handler(BaseHTTPRequestHandler):
                     blocked=set(CFG.get("blocked_dids") or ()))
             meta_set(ckey, f"{time.time()}|{json.dumps(out)}")
             return self._send(200, out)
+
+        if u.path in ("/guide", "/guia"):
+            return self._send(200, render_guide_page(CFG), "text/html")
 
         if u.path == "/quiz":
             return self._send(200, render_quiz_page(CFG), "text/html")
