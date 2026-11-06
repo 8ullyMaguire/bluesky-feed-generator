@@ -188,6 +188,13 @@ DB_PATH = os.environ.get("FEEDGEN_DB") or os.path.join(
 LEGACY_STATE_PATH = os.environ.get("FEEDGEN_STATE_PATH") or os.path.join(
     BASE, "feedgen-state.json"
 )
+# The last computed boards, kept beside the deployment's own database so the two
+# deployments never share one and the file lands on the same filesystem as the
+# database rather than on the pool. A restart serves this while the first refresh
+# runs; without it the port answers empty skeletons for the minutes a cold crawl
+# takes, which is indistinguishable from a failed refresh.
+BOARDS_PATH = os.environ.get("FEEDGEN_BOARDS") or os.path.join(
+    os.path.dirname(DB_PATH) or BASE, "boards.json")
 
 CACHE: dict = {
     "feeds": {}, "feed_scores": {}, "updated": 0, "scanned": 0, "members": 0,
@@ -3077,6 +3084,7 @@ def refresh_loop():
     while True:
         try:
             picks, stats, fstats = refresh()
+            save_boards(picks)
             with CACHE_LOCK:
                 CACHE.update(feeds=picks, stats=stats, updated=time.time(),
                              scanned=fstats["posts_stored"],
@@ -4293,15 +4301,54 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def save_boards(picks):
+    """Write the last computed boards. Best-effort: a failure to persist must
+    never fail a refresh that succeeded."""
+    try:
+        tmp = BOARDS_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"at": time.time(), "feeds": picks}, fh)
+        os.replace(tmp, BOARDS_PATH)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[{SVC_TAG}] board save failed: {e}", flush=True)
+
+
+def load_boards():
+    """The last persisted boards, or None. A missing or unreadable file is not
+    an error — the first refresh simply runs exactly as it did before."""
+    try:
+        with open(BOARDS_PATH) as fh:
+            blob = json.load(fh)
+        feeds = blob.get("feeds")
+        if isinstance(feeds, dict) and feeds:
+            return feeds
+    except FileNotFoundError:
+        pass
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[{SVC_TAG}] board load failed: {e}", flush=True)
+    return None
+
+
 def warm_start():
     """First refresh, then the periodic loop. Runs in a background thread so the
     HTTP port is already open while the scan runs — a cold warm-up can take
     minutes (the scan walks the list members' recent posts) and clients used to
     get 'connection refused' for that whole window. Until the first refresh
-    lands the feeds serve empty, exactly as they do after a failed refresh."""
+    lands the feeds serve empty, exactly as they do after a failed refresh.
+
+    The last board is loaded first, so a restart serves slightly stale content
+    rather than nothing: an empty skeleton and a failed refresh are the same
+    thing to a reader, and the crawl that distinguishes them takes minutes."""
+    stale = load_boards()
+    if stale:
+        with CACHE_LOCK:
+            CACHE.update(feeds=stale, updated=time.time(), gen=0)
+        print(f"[{SVC_TAG}] serving {sum(len(v) for v in stale.values())} persisted "
+              f"picks while warming", flush=True)
     print(f"[{SVC_TAG}] warming cache (first refresh)...", flush=True)
     try:
         picks, stats, fstats = refresh()
+        save_boards(picks)
         with CACHE_LOCK:
             CACHE.update(feeds=picks, stats=stats, updated=time.time(),
                          scanned=fstats["posts_stored"], members=fstats["list_items"],
