@@ -3520,7 +3520,7 @@ def render_age_gate(next_path="/"):
  a.btn{{display:inline-block;margin:0 1rem 1rem 0;padding:.7rem 1.2rem;border-radius:.5rem;background:#ececf1;color:#0d0d10;text-decoration:none;font-weight:600}}
  a.alt{{color:#9a9aa5}}
 </style></head>
-<body><main>
+<body><main id="age-gate">
 <h1>Este sitio contiene material para adultos</h1>
 <p>BNWO feeds reúne y ordena publicaciones para adultos. Confirma que tienes 18 años o más para continuar.</p>
 <p class="fine">Es una declaración propia, no una verificación de edad: aquí no se comprueba quién eres — solo se anota que
