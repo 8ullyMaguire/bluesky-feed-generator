@@ -169,6 +169,165 @@ def test_min_topic_affinity_floor_drops_offtopic_authors():
           "the sample is big enough")
 
 
+
+def test_hide_seen_scope_can_be_per_feed():
+    """Seen memory defaults to the service (the owner's "never see a post
+    twice"), but a feed may scope it to itself: a reader who opens a different
+    window then gets that window's own best posts instead of inheriting the
+    first feed's burn. Same rows, same TTL — only the WHERE clause differs."""
+    now = time.time()
+    fg.db().execute("DELETE FROM served_posts WHERE requester_did=?",
+                    ("did:plc:scope",))
+    fg.db().execute("INSERT INTO served_posts VALUES(?,?,?,?,0)",
+                    ("did:plc:scope",
+                     "at://did:plc:a/app.bsky.feed.post/in-a", "feed-a",
+                     now - 600))
+    shared = fg.user_excluded_uris("did:plc:scope", True)
+    assert "at://did:plc:a/app.bsky.feed.post/in-a" in shared, shared
+    per_feed_a = fg.user_excluded_uris(
+        "did:plc:scope", True, feed_rkey="feed-a", scope="feed")
+    per_feed_b = fg.user_excluded_uris(
+        "did:plc:scope", True, feed_rkey="feed-b", scope="feed")
+    assert "at://did:plc:a/app.bsky.feed.post/in-a" in per_feed_a, per_feed_a
+    assert per_feed_b == set(), per_feed_b
+    print("ok  hide_seen_scope=feed hides only what that feed served")
+
+
+def test_topic_post_floor_is_continuous():
+    """Post-level topicality: a keyword hit is full evidence, anything else
+    inherits half its author's affinity. The threshold then separates a
+    topical author's off-vocabulary post from a firehose author's, instead of
+    the binary "author is fine, every post passes" cliff."""
+    good, bad = "did:plc:topicgood", "did:plc:topicbad"
+    posts = [post(likes=10, did=good, key="g"),
+             post(likes=10, did=bad, key="b")]
+    fcfg = {"rkey": "t", "max_posts": 50, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24,
+            "topic_post_floor": 0.4}
+    ctx = dict(CTX, topic_affinity={good: 0.9, bad: 0.05},
+               topic_keywords=["kink"], topic_totals={good: 100, bad: 100})
+    scored, st = fg.select(posts, fcfg, NOW, {"did": "did:plc:pfowner"}, ctx, set())
+    uris = [u for u, _s in scored]
+    assert any(good in u for u in uris), uris      # 0.9 * 0.5 = 0.45 >= 0.4
+    assert not any(bad in u for u in uris), uris   # 0.05 * 0.5 = 0.025
+    assert st.get("topic_post") == 1, st
+    # A keyword in the post rescues even the low-affinity author.
+    posts2 = posts + [post(likes=10, did=bad, key="b2", text="kink tonight")]
+    scored2, _ = fg.select(posts2, fcfg, NOW, {"did": "did:plc:pfowner"}, ctx, set())
+    assert any("b2" in u for u, _s in scored2), [u for u, _s in scored2]
+    # No key on the feed: unchanged ranking.
+    scored3, _ = fg.select(posts, {k: v for k, v in fcfg.items()
+                                   if k != "topic_post_floor"},
+                           NOW, {"did": "did:plc:pfowner"}, ctx, set())
+    assert any(bad in u for u, _s in scored3)
+    print("ok  topic_post_floor scores the post, not just its author")
+
+
+def test_owner_gate_bypass_can_be_disabled():
+    """owner.gate_bypass: false keeps the owner's boost and cap but makes their
+    posts clear the same floors as everyone else's."""
+    owner = "did:plc:gatedowner"
+    posts = [post(likes=2, did=owner, key="own1")] + [
+        post(likes=5, did="did:plc:other", key="o%d" % i) for i in range(4)]
+    # adaptive_target: 0 pins the configured gates; otherwise a thin candidate
+    # set relaxes min_likes to 0 and the test would prove nothing.
+    fcfg = {"rkey": "t", "max_posts": 50, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24, "min_likes": 3,
+            "adaptive_target": 0}
+    bypass = {"did": owner, "always_include": True, "boost": 1.3,
+              "bonus": 0.0, "max_ratio": 0.5}
+    scored, st = fg.select(posts, fcfg, NOW, bypass, CTX, set())
+    assert any("own1" in u for u, _s in scored), [u for u, _s in scored]
+    scored2, st2 = fg.select(posts, fcfg, NOW, dict(bypass, gate_bypass=False),
+                             CTX, set())
+    assert not any("own1" in u for u, _s in scored2), [u for u, _s in scored2]
+    assert any("o1" in u for u, _s in scored2), [u for u, _s in scored2]
+    assert len(scored2) == 4, [u for u, _s in scored2]
+    print("ok  owner.gate_bypass=false puts owner posts through the gates")
+
+
+def test_cold_start_can_seed_from_follows():
+    """Reader follows are the cheapest taste signal available: one public call
+    names dozens of accounts. Only follows already in the candidate pool are
+    seeded, and the whole path is off unless `tension.cold_start_follows`."""
+    me = "did:plc:newreader"
+    followed_known, followed_unknown = "did:plc:followed-known", "did:plc:nobody"
+    db_insert_post("at://%s/app.bsky.feed.post/knownpost" % followed_known,
+                   followed_known)
+    fg.db().execute("DELETE FROM user_affinity WHERE requester_did=?", (me,))
+    fg.db().execute("DELETE FROM meta WHERE k LIKE ?", ("coldstart:%",))
+    tension = fg.CFG.setdefault("tension", {})
+    had = tension.get("cold_start_follows")
+    real_likes, real_follows = (getattr(fg, "fetch_requester_likes", None),
+                                getattr(fg, "fetch_requester_follows", None))
+    try:
+        tension["cold_start_follows"] = False
+        fg.fetch_requester_likes = lambda did, pages: ([], {}, True)
+        fg.fetch_requester_follows = lambda did, pages: [followed_known,
+                                                         followed_unknown]
+        fg.seed_cold_start(me)
+        assert not fg.db().execute(
+            "SELECT 1 FROM user_affinity WHERE requester_did=?", (me,)
+        ).fetchone(), "seeded without the flag"
+        fg.db().execute("DELETE FROM meta WHERE k=?", ("coldstart:" + me,))
+        tension["cold_start_follows"] = True
+        fg.seed_cold_start(me)
+        rows = {r[0] for r in fg.db().execute(
+            "SELECT author_did FROM user_affinity WHERE requester_did=?", (me,))}
+        assert followed_known in rows, rows
+        assert followed_unknown not in rows, rows
+    finally:
+        if had is None:
+            tension.pop("cold_start_follows", None)
+        else:
+            tension["cold_start_follows"] = had
+        if real_likes:
+            fg.fetch_requester_likes = real_likes
+        if real_follows:
+            fg.fetch_requester_follows = real_follows
+        fg.db().execute("DELETE FROM user_affinity WHERE requester_did=?", (me,))
+        fg.db().execute("DELETE FROM meta WHERE k=?", ("coldstart:" + me,))
+    print("ok  cold start can seed affinity from the reader's follows")
+
+
+def test_relevance_telemetry_is_persisted():
+    """The telemetry the relevance work needs: keyword hit rate, text-less
+    share, median author topicality and engagement concentration, per board,
+    in metrics_log — so a config change can be read instead of inferred."""
+    fg.migrate_schema()   # a fresh test DB starts from SCHEMA, not the live shape
+    cols = {r[1] for r in fg.db().execute("PRAGMA table_info(metrics_log)")}
+    for c in ("kw_hit_rate", "no_text_rate", "affinity_p50",
+              "engagement_gini"):
+        assert c in cols, (c, cols)
+    posts = [post(likes=10, did="did:plc:tela", key="k1", text="kink"),
+             post(likes=0, did="did:plc:telb", key="k2", text=""),
+             post(likes=5, did="did:plc:tela", key="k3", text="unrelated")]
+    for _p in posts:      # log_metrics reads the board back out of posts
+        fg.db().execute(
+            "INSERT OR REPLACE INTO posts(uri, cid, author_did, author_handle, "
+            "indexed_at, record_json, first_seen, last_seen, text, like_count) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (_p["uri"], "c", _p["author"]["did"], "h.test",
+             _p["indexedAt"], "{}", time.time(), time.time(),
+             _p["record"]["text"], _p["likeCount"]))
+    fg.CFG.setdefault("topic_keywords", [])
+    had_kw = list(fg.CFG["topic_keywords"])
+    fg.CFG["topic_keywords"] = ["kink"]
+    try:
+        fg.log_metrics({"tl-a": [p["uri"] for p in posts]}, {}, time.time())
+    finally:
+        fg.CFG["topic_keywords"] = had_kw
+    row = fg.db().execute(
+        "SELECT kw_hit_rate, no_text_rate, engagement_gini FROM metrics_log "
+        "WHERE feed_rkey='tl-a' ORDER BY ts DESC LIMIT 1").fetchone()
+    assert row[0] is not None and abs(row[0] - 1 / 3.0) < 0.01, row
+    assert row[1] is not None and abs(row[1] - 1 / 3.0) < 0.01, row
+    assert row[2] is not None and 0.0 <= row[2] <= 1.0, row
+    # Leave the table as this suite's other assertions expect to find it.
+    fg.db().execute("DELETE FROM metrics_log")
+    print("ok  relevance telemetry is computed and persisted per board")
+
+
 def test_feed_owner_override_is_per_feed_and_off_by_default():
     """A feed may opt out of the owner boost/inclusion with its own `owner`
     block; a feed without one must rank exactly as before. The generic feed
@@ -889,6 +1048,11 @@ if __name__ == "__main__":
     test_author_prior_multiplies()
     test_select_returns_scored_tuples()
     test_select_owner_ratio_cap()
+    test_hide_seen_scope_can_be_per_feed()
+    test_topic_post_floor_is_continuous()
+    test_owner_gate_bypass_can_be_disabled()
+    test_cold_start_can_seed_from_follows()
+    test_relevance_telemetry_is_persisted()
     test_feed_owner_override_is_per_feed_and_off_by_default()
     test_min_topic_affinity_floor_drops_offtopic_authors()
     test_engagement_snapshots_schema()

@@ -451,6 +451,8 @@ CREATE TABLE IF NOT EXISTS metrics_log (
     ts REAL NOT NULL, feed_rkey TEXT NOT NULL, posts INTEGER,
     unique_authors INTEGER, median_age_hours REAL,
     score_median REAL, score_p90 REAL,
+    kw_hit_rate REAL, no_text_rate REAL, affinity_p50 REAL,
+    engagement_gini REAL,
     PRIMARY KEY (ts, feed_rkey))
 """
 
@@ -489,6 +491,13 @@ def migrate_schema():
             if col not in ml:
                 db().execute(
                     f"ALTER TABLE metrics_log ADD COLUMN {col} INTEGER DEFAULT 0")
+        # Relevance telemetry: keyword hit rate, share of text-less media,
+        # median author topicality and engagement concentration per board.
+        for col in ("kw_hit_rate", "no_text_rate", "affinity_p50",
+                    "engagement_gini"):
+            if col not in ml:
+                db().execute(
+                    f"ALTER TABLE metrics_log ADD COLUMN {col} REAL")
         db().execute("CREATE INDEX IF NOT EXISTS idx_served_feed_time "
                      "ON served_posts(feed_rkey, served_at)")
         db().execute("CREATE INDEX IF NOT EXISTS idx_events_kind_time "
@@ -699,6 +708,33 @@ def feed_owner(owner, fcfg):
     return out
 
 
+def post_topic_text(p):
+    """Everything a topicality test may read from one post: its own text plus
+    any alt text on its media. Alt text is the only subject a text-less media
+    post carries, which is why it counts as evidence rather than decoration."""
+    rec = p.get("record") if isinstance(p.get("record"), dict) else {}
+    blob = [rec.get("text") or ""]
+    emb = rec.get("embed") if isinstance(rec.get("embed"), dict) else {}
+    if isinstance(emb.get("alt"), str):
+        blob.append(emb["alt"])
+    for im in (emb.get("images") or ()):
+        if isinstance(im, dict) and isinstance(im.get("alt"), str):
+            blob.append(im["alt"])
+    return " ".join(blob).lower()
+
+
+def gini(vals):
+    """Concentration of engagement on a board: 0 = all equal, 1 = one post
+    holds everything. Above ~0.8 a single viral post is eating the board."""
+    v = sorted(float(x) for x in vals if x is not None)
+    n = len(v)
+    total = sum(v)
+    if not n or total <= 0:
+        return 0.0
+    cum = sum((i + 1) * x for i, x in enumerate(v))
+    return (2.0 * cum) / (n * total) - (n + 1) / n
+
+
 def select(posts, fcfg, now, owner, ctx, suppressed):
     """Rank the posts for one feed. Returns (uris, stats).
 
@@ -755,7 +791,10 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
         reposts = p.get("repostCount", 0)
 
         # --- owner posts bypass every gate, including suppression ---
-        if not is_owner:
+        # A feed may set owner.gate_bypass: false; the owner then keeps the
+        # boost and the cap but has to clear the same floors as everyone else,
+        # which is the honest version of "my content is good enough".
+        if not is_owner or not owner.get("gate_bypass", True):
             # Author topicality floor: an account whose stored corpus barely
             # mentions the subject is the firehose a topical feed does not
             # want, however many likes one of its posts collected. Applied
@@ -776,18 +815,23 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
                     # account the corpus has seen once rides in on likes
                     # alone. Alt text counts as evidence — a media post can
                     # carry its subject there.
-                    rec = p.get("record") if isinstance(p.get("record"), dict) else {}
-                    blob = [rec.get("text") or ""]
-                    emb = rec.get("embed") if isinstance(rec.get("embed"), dict) else {}
-                    if isinstance(emb.get("alt"), str):
-                        blob.append(emb["alt"])
-                    for im in (emb.get("images") or ()):
-                        if isinstance(im, dict) and isinstance(im.get("alt"), str):
-                            blob.append(im["alt"])
-                    low = " ".join(blob).lower()
+                    low = post_topic_text(p)
                     if not any(k in low for k in (ctx.get("topic_keywords") or [])):
                         stats["topic_unjudged"] = stats.get("topic_unjudged", 0) + 1
                         continue
+            # Post-level topicality, continuous instead of a cliff: a keyword
+            # hit is full evidence, anything else inherits HALF its author's
+            # topicality. A 0.9-affinity author keeps a post phrased without
+            # the vocabulary; a 0.05-affinity one does not. One threshold
+            # replaces per-author exceptions when a feed sets this key.
+            pfloor = fcfg.get("topic_post_floor")
+            if pfloor:
+                low = post_topic_text(p)
+                hit = any(k in low for k in (ctx.get("topic_keywords") or []))
+                pt = 1.0 if hit else ctx["topic_affinity"].get(did, 0.0) * 0.5
+                if pt < float(pfloor):
+                    stats["topic_post"] = stats.get("topic_post", 0) + 1
+                    continue
             # Selective axes. Each of these makes a feed answer a DIFFERENT
             # question from the time-window Top feeds; without them every feed
             # is the same ranker with a different max_age_hours. Owner posts
@@ -1586,6 +1630,20 @@ def build_topic_affinity():
             continue
     for did in seeds:
         aff[did] = max(aff.get(did, 0.0), 1.0)
+    # Persisted for the telemetry layer and for probes: recomputing this map
+    # from the corpus is the expensive part, and /status needs it read-only.
+    try:
+        now = time.time()
+        with DB_LOCK:
+            db().executemany(
+                "INSERT OR REPLACE INTO author_topic(author_did, topic_posts, "
+                "total_posts, affinity, updated_at) VALUES (?,?,?,?,?)",
+                [(d, int(round(aff.get(d, 0.0) * tot.get(d, 0))),
+                  int(tot.get(d, 0)), float(aff.get(d, 0.0)), now)
+                 for d in tot])
+            db().commit()
+    except Exception as e:                                    # noqa: BLE001
+        print(f"[{SVC_TAG}] author_topic persist failed: {e}", flush=True)
     return aff, seeds, tot
 
 
@@ -2133,7 +2191,8 @@ def log_served_posts(requester_did, rkey, uris):
             "VALUES(date(?, 'unixepoch'), ?)", (now, requester_did))
 
 
-def user_excluded_uris(requester_did, include_seen=False, protect_did=None):
+def user_excluded_uris(requester_did, include_seen=False, protect_did=None,
+                       feed_rkey=None, scope="service"):
     """Post URIs this requester must not be shown.
 
     Union of:
@@ -2176,11 +2235,19 @@ def user_excluded_uris(requester_did, include_seen=False, protect_did=None):
     if include_seen:
         ttl_h = CFG.get("hide_seen_ttl_h", 24) or 24
         cutoff = time.time() - ttl_h * 3600
-        # No feed_rkey filter (shared across the service); the existing
-        # idx_served_requester(requester_did, served_at) index serves this.
-        for (uri,) in db().execute(
-                "SELECT post_uri FROM served_posts WHERE requester_did=? "
-                "AND served_at >= ?", (requester_did, cutoff)).fetchall():
+        # Scope "service" (default): a post shown in any feed of this
+        # deployment is spent everywhere — the owner's "I would rather never
+        # see a post twice". Scope "feed": seen memory belongs to the feed
+        # that showed it, so a reader who opens a different window sees that
+        # window's own best posts instead of inheriting the first feed's
+        # burn. Both are bounded by the same TTL.
+        sql = ("SELECT post_uri FROM served_posts WHERE requester_did=? "
+               "AND served_at >= ?")
+        args = [requester_did, cutoff]
+        if scope == "feed" and feed_rkey:
+            sql += " AND feed_rkey=?"
+            args.append(feed_rkey)
+        for (uri,) in db().execute(sql, args).fetchall():
             out.add(uri)
         if own_read:
             # The owner's OWN posts never come back once served, TTL or not:
@@ -2393,6 +2460,39 @@ COLD_START_PAGES = 2
 COLD_START_SCORE = 0.3
 
 
+def fetch_requester_follows(requester_did, pages=2):
+    """DIDs this account follows, read from the public AppView.
+
+    `app.bsky.graph.getFollows` answers for any account without a session
+    (verified 2026-11-04 while building growth), so this costs one or two
+    anonymous calls. Returns [] on any failure: cold start is best-effort and
+    must never block a request.
+    """
+    out, cursor = [], None
+    appview = CFG["source"]["appview_host"]
+    for _ in range(max(1, int(pages))):
+        q = urllib.parse.urlencode(
+            {"actor": requester_did, "limit": 100}
+            | ({"cursor": cursor} if cursor else {}))
+        try:
+            d = rpc(appview, f"app.bsky.graph.getFollows?{q}", timeout=15)
+        except Exception as e:                                # noqa: BLE001
+            print(f"[{SVC_TAG}] cold start: getFollows failed for "
+                  f"{requester_did[:20]}: {str(e)[:90]}", flush=True)
+            break
+        items = d.get("follows") or []
+        if not items:
+            break
+        for it in items:
+            did = it.get("did")
+            if did and did not in out:
+                out.append(did)
+        cursor = d.get("cursor")
+        if not cursor:
+            break
+    return out
+
+
 def seed_cold_start(requester_did):
     """Cold-start: seed a brand-new requester's user_affinity from their
     PUBLIC likes (com.atproto.repo.listRecords is public on the PDS), so
@@ -2414,6 +2514,27 @@ def seed_cold_start(requester_did):
     if not ok:
         return 0
     now = time.time()
+    # Who they follow is a stronger and cheaper signal than what they liked:
+    # one public call names dozens of accounts, while likes need many records
+    # to say anything. Only follows that are already in our candidate pool
+    # count — an affinity entry for an author we never fetch is dead weight.
+    tcfg = CFG.get("tension") or {}
+    follow_seeded = 0
+    if tcfg.get("cold_start_follows"):
+        follows = fetch_requester_follows(
+            requester_did, int(tcfg.get("cold_start_follow_pages", 2)))
+        known = [d for d in follows
+                 if d != requester_did and db().execute(
+                     "SELECT 1 FROM posts WHERE author_did=? LIMIT 1",
+                     (d,)).fetchone()]
+        if known:
+            with DB_LOCK:
+                db().executemany(
+                    "INSERT OR IGNORE INTO user_affinity(requester_did, "
+                    "author_did, score, updated_at) VALUES (?,?,?,?)",
+                    [(requester_did, a, COLD_START_SCORE, now) for a in known])
+                db().commit()
+            follow_seeded = len(known)
     with DB_LOCK:
         if counts:
             db().executemany(
@@ -2429,7 +2550,8 @@ def seed_cold_start(requester_did):
     meta_set(flag, str(now))
     meta_set(f"ulikes:{requester_did}", now)
     print(f"[{SVC_TAG}] cold-start seeded {len(counts)} authors / "
-          f"{len(uris)} liked posts for {requester_did[:24]}", flush=True)
+          f"{len(uris)} liked posts / {follow_seeded} follows for "
+          f"{requester_did[:24]}", flush=True)
     return len(counts)
 
 
@@ -2447,19 +2569,29 @@ def log_metrics(picks_by_feed, feed_scores, now_ts, stats=None):
                 (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
 
         rows = []
+        KWS = [k.lower() for k in CFG.get("topic_keywords", [])]
+        try:
+            AFF = {d: a for d, a in db().execute(
+                "SELECT author_did, affinity FROM author_topic")}
+        except sqlite3.Error:
+            AFF = {}
         for rkey, uris in (picks_by_feed or {}).items():
             uris = list(uris or [])
             if not uris:
-                rows.append((ts, rkey, 0, 0, None, None, None))
+                rows.append((ts, rkey, 0, 0, None, None, None,
+                             None, None, None, None))
                 continue
             scores = (feed_scores or {}).get(rkey, {})
             authors, ages, sc = set(), [], []
+            kw_hit = no_text = 0
+            engs, affs = [], []
             for chunk_start in range(0, len(uris), 500):
                 chunk = uris[chunk_start:chunk_start + 500]
                 q = ",".join("?" * len(chunk))
-                for uri, a, idx in db().execute(
-                        f"SELECT uri, author_did, indexed_at FROM posts "
-                        f"WHERE uri IN ({q})", chunk):
+                for uri, a, idx, text, rj, lk, rp, rl in db().execute(
+                        f"SELECT uri, author_did, indexed_at, text, "
+                        f"record_json, like_count, repost_count, reply_count "
+                        f"FROM posts WHERE uri IN ({q})", chunk):
                     authors.add(a)
                     try:
                         ages.append((now_ts - parse_time(idx)).total_seconds()
@@ -2469,13 +2601,35 @@ def log_metrics(picks_by_feed, feed_scores, now_ts, stats=None):
                     s = scores.get(uri)
                     if s is not None:
                         sc.append(s)
+                    blob = (text or "").lower()
+                    if rj and '"alt"' in rj:
+                        try:
+                            _r = json.loads(rj).get("record") or {}
+                            _e = _r.get("embed") or {}
+                            blob += " " + str(_e.get("alt") or "").lower()
+                            for _im in (_e.get("images") or []) or []:
+                                if isinstance(_im, dict):
+                                    blob += " " + str(_im.get("alt") or "").lower()
+                        except Exception:
+                            pass
+                    if any(k in blob for k in KWS):
+                        kw_hit += 1
+                    if not (text or "").strip():
+                        no_text += 1
+                    engs.append((lk or 0) + 2 * (rp or 0) + 3 * (rl or 0))
+                    affs.append(AFF.get(a, 0.0))
             sc_sorted = sorted(sc)
             p90 = sc_sorted[min(len(sc_sorted) - 1,
                                 int(len(sc_sorted) * 0.9))] if sc_sorted else None
-            rows.append((ts, rkey, len(uris), len(authors),
+            n_board = len(uris)
+            rows.append((ts, rkey, n_board, len(authors),
                          round(_med(ages), 2) if ages else None,
                          round(_med(sc), 2) if sc else None,
-                         round(p90, 2) if p90 is not None else None))
+                         round(p90, 2) if p90 is not None else None,
+                         round(kw_hit / n_board, 3) if n_board else None,
+                         round(no_text / n_board, 3) if n_board else None,
+                         round(_med(affs), 3) if affs else None,
+                         round(gini(engs), 3) if engs else None))
         funnel = {}
         for rkey, st in (stats or {}).items():
             prev = db().execute(
@@ -2496,8 +2650,9 @@ def log_metrics(picks_by_feed, feed_scores, now_ts, stats=None):
             db().executemany(
                 "INSERT OR REPLACE INTO metrics_log(ts, feed_rkey, posts, "
                 "unique_authors, median_age_hours, score_median, score_p90, "
+                "kw_hit_rate, no_text_rate, affinity_p50, engagement_gini, "
                 "in_window, post_gate, suppressed, final, served) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [tuple(r) + funnel.get(r[1], (0, 0, 0, 0, 0)) for r in rows])
             db().execute("DELETE FROM metrics_log WHERE ts < ?",
                          (ts - 90 * 86400,))
@@ -4125,14 +4280,17 @@ def render_status_page(snap, cfg):
     mrows = ""
     eng = likes_per_1k(7)
     try:
-        for rk, n, ua, ma, sm, sp, iw, pg, su, fi, se in db().execute(
+        for (rk, n, ua, ma, sm, sp, kw, nt, ap, gi,
+             iw, pg, su, fi, se) in db().execute(
                 "SELECT feed_rkey, posts, unique_authors, "
                 "median_age_hours, score_median, score_p90, "
+                "kw_hit_rate, no_text_rate, affinity_p50, engagement_gini, "
                 "in_window, post_gate, suppressed, final, served FROM "
                 "metrics_log WHERE ts=(SELECT MAX(ts) FROM metrics_log)"):
             e = eng.get(rk) or {}
             mrows += (f"<tr><td>{rk}</td><td>{n}</td><td>{ua}</td>"
                       f"<td>{ma}</td><td>{sm}</td><td>{sp}</td>"
+                      f"<td>{kw}</td><td>{nt}</td><td>{ap}</td><td>{gi}</td>"
                       f"<td>{iw}</td><td>{pg}</td><td>{su}</td><td>{fi}</td>"
                       f"<td>{se}</td><td>{e.get('likes', 0)}</td>"
                       f"<td>{e.get('per_1k', 0.0)}</td></tr>")
@@ -4141,7 +4299,9 @@ def render_status_page(snap, cfg):
     metrics_html = (f"<h2>metrics (latest refresh)</h2><table border=1>"
                     f"<tr><th>feed</th><th>posts</th><th>unique authors</th>"
                     f"<th>median age h</th><th>score median</th>"
-                    f"<th>score p90</th><th>in_window</th><th>post_gate</th>"
+                    f"<th>score p90</th><th>kw hit</th><th>no text</th>"
+                    f"<th>aff p50</th><th>eng gini</th>"
+                    f"<th>in_window</th><th>post_gate</th>"
                     f"<th>suppressed</th><th>final</th><th>served</th>"
                     f"<th>likes 7d</th><th>likes/1k</th></tr>{mrows}</table>")
     out = (
@@ -4277,7 +4437,9 @@ class Handler(BaseHTTPRequestHandler):
             if requester_did:
                 excluded = user_excluded_uris(
                     requester_did, hide_seen,
-                    protect_did=(CFG.get("owner") or {}).get("did"))
+                    protect_did=(CFG.get("owner") or {}).get("did"),
+                    feed_rkey=uri.rsplit("/", 1)[-1],
+                    scope=(FEEDS[uri].get("hide_seen_scope") or "service"))
 
             # The owner's own repeats are dropped even past the starvation
             # floor: a floor exists so a heavy reader is not starved of OTHER
