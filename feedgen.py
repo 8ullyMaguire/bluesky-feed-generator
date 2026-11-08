@@ -720,7 +720,8 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
     gate_mode = fcfg.get("gate_mode", "all")
     stats = {"in_window": 0, "pass_share": 0, "pass_gates": 0,
              "suppressed": 0, "final": 0, "owner": 0,
-             "vintage_cands": 0, "vintage_picked": 0, "over_max_likes": 0}
+             "vintage_cands": 0, "vintage_picked": 0, "over_max_likes": 0,
+             "topic_floor": 0, "topic_unjudged": 0}
     ranking_mode = fcfg.get("ranking", "flat")
     vfrac = fcfg.get("vintage_slot_fraction", 0.0) or 0.0
     v_min = fcfg.get("vintage_min_age_hours", 6)
@@ -755,6 +756,38 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
 
         # --- owner posts bypass every gate, including suppression ---
         if not is_owner:
+            # Author topicality floor: an account whose stored corpus barely
+            # mentions the subject is the firehose a topical feed does not
+            # want, however many likes one of its posts collected. Applied
+            # before the engagement gates because it is an author property,
+            # not a post one. Authors with too few stored posts to judge are
+            # left alone (topic_min_posts), and topic_seeds are pinned to 1.0
+            # upstream so they always pass.
+            floor = fcfg.get("min_topic_affinity")
+            if floor:
+                seen_posts = (ctx.get("topic_totals") or {}).get(did, 0)
+                if seen_posts >= int(fcfg.get("topic_min_posts", 10)):
+                    if ctx["topic_affinity"].get(did, 0.0) < float(floor):
+                        stats["topic_floor"] = stats.get("topic_floor", 0) + 1
+                        continue
+                else:
+                    # Too little history to judge the author, so judge the
+                    # post: without this, a viral off-topic post from an
+                    # account the corpus has seen once rides in on likes
+                    # alone. Alt text counts as evidence — a media post can
+                    # carry its subject there.
+                    rec = p.get("record") if isinstance(p.get("record"), dict) else {}
+                    blob = [rec.get("text") or ""]
+                    emb = rec.get("embed") if isinstance(rec.get("embed"), dict) else {}
+                    if isinstance(emb.get("alt"), str):
+                        blob.append(emb["alt"])
+                    for im in (emb.get("images") or ()):
+                        if isinstance(im, dict) and isinstance(im.get("alt"), str):
+                            blob.append(im["alt"])
+                    low = " ".join(blob).lower()
+                    if not any(k in low for k in (ctx.get("topic_keywords") or [])):
+                        stats["topic_unjudged"] = stats.get("topic_unjudged", 0) + 1
+                        continue
             # Selective axes. Each of these makes a feed answer a DIFFERENT
             # question from the time-window Top feeds; without them every feed
             # is the same ranker with a different max_age_hours. Owner posts
@@ -1517,14 +1550,19 @@ def build_topic_affinity():
 
     affinity = share of the author's stored posts that hit a topic keyword.
     Config `topic_seeds` (handles or DIDs) are pinned to 1.0.
+
+    Returns `(affinity, seeds, totals)`; `totals` is how many of that author's
+    posts the share was computed over, which is what a feed needs to decide
+    whether the number is worth acting on (`topic_min_posts`).
     """
     keywords = [k.lower() for k in CFG.get("topic_keywords", [])]
     aff = {}
+    tot = {}
     if keywords:
         rows = db().execute(
             "SELECT author_did, text FROM posts WHERE last_seen > ?",
             (time.time() - 90 * 86400,)).fetchall()
-        tot, hits = {}, {}
+        hits = {}
         for did, text in rows:
             tot[did] = tot.get(did, 0) + 1
             low = (text or "").lower()
@@ -1548,7 +1586,7 @@ def build_topic_affinity():
             continue
     for did in seeds:
         aff[did] = max(aff.get(did, 0.0), 1.0)
-    return aff, seeds
+    return aff, seeds, tot
 
 
 # --- adaptive keyword weights (optional, config-gated) ----------------------
@@ -3048,7 +3086,7 @@ def refresh():
     fstats["fetched"] = fetched
     _t_ingest = time.monotonic()
 
-    topic_affinity, topic_seeds = build_topic_affinity()
+    topic_affinity, topic_seeds, topic_totals = build_topic_affinity()
     taste = build_taste(token)
     try:
         taste = apply_taste_sources(taste)
@@ -3062,7 +3100,7 @@ def refresh():
     ctx = {
         "topic_affinity": topic_affinity, "topic_seeds": topic_seeds, "taste": taste,
         "topic_keywords": [k.lower() for k in CFG.get("topic_keywords", [])],
-        "author_priors": priors,
+        "author_priors": priors, "topic_totals": topic_totals,
     }
 
     owner = CFG.get("owner", {})

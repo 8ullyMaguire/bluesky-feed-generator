@@ -124,6 +124,51 @@ def test_select_owner_ratio_cap():
     print(f"ok  owner ratio cap holds ({n_own}/{len(uris)} owner posts)")
 
 
+def test_min_topic_affinity_floor_drops_offtopic_authors():
+    """A feed may refuse authors whose stored corpus barely mentions the
+    subject — the firehose problem — while leaving alone authors it has not
+    seen enough posts from to judge."""
+    good, bad = "did:plc:ontopic", "did:plc:firehose"
+    posts = [post(likes=50, did=good, key="g1"),
+             post(likes=90, did=bad, key="b1"),
+             post(likes=90, did=bad, key="b2")]
+    fcfg = {"rkey": "t", "max_posts": 100, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24,
+            "min_topic_affinity": 0.10, "topic_min_posts": 10}
+    base = {"topic_affinity": {good: 0.8, bad: 0.0}, "topic_seeds": set(),
+            "taste": {}, "topic_keywords": [], "author_priors": {},
+            "topic_totals": {good: 100, bad: 3000}}
+    scored, st = fg.select(posts, fcfg, NOW, {"did": "did:plc:floorowner"},
+                           base, set())
+    uris = [u for u, _s in scored]
+    assert uris and all(bad not in u for u in uris), uris
+    assert any(good in u for u in uris), uris
+    assert st.get("topic_floor") == 2, st
+    # Too few stored posts to judge the author: the POST has to carry the
+    # evidence. The fixture's texts have no keyword, so the one-off account is
+    # dropped here — this is the viral-post-from-a-stranger hole.
+    few = dict(base, topic_totals={good: 100, bad: 3})
+    scored2, _ = fg.select(posts, fcfg, NOW, {"did": "did:plc:floorowner"},
+                           few, set())
+    assert not any(bad in u for u, _s in scored2), [u for u, _s in scored2]
+    # ...and it is kept when the post itself is on topic, whether in the text
+    # or in a media post's alt text.
+    kw = dict(few, topic_keywords=["bnwo"])
+    posts_text = posts + [post(likes=90, did=bad, key="b3", text="bnwo tonight")]
+    scored_t, _ = fg.select(posts_text, fcfg, NOW, {"did": "did:plc:floorowner"},
+                            kw, set())
+    assert any("b3" in u for u, _s in scored_t), [u for u, _s in scored_t]
+    assert not any("b1" in u for u, _s in scored_t), [u for u, _s in scored_t]
+    # No knob on the feed: unchanged ranking.
+    fcfg_off = {k: v for k, v in fcfg.items()
+                if k not in ("min_topic_affinity", "topic_min_posts")}
+    scored3, _ = fg.select(posts, fcfg_off, NOW, {"did": "did:plc:floorowner"},
+                           base, set())
+    assert any(bad in u for u, _s in scored3)
+    print("ok  min_topic_affinity drops off-topic firehose authors only when "
+          "the sample is big enough")
+
+
 def test_feed_owner_override_is_per_feed_and_off_by_default():
     """A feed may opt out of the owner boost/inclusion with its own `owner`
     block; a feed without one must rank exactly as before. The generic feed
@@ -845,6 +890,7 @@ if __name__ == "__main__":
     test_select_returns_scored_tuples()
     test_select_owner_ratio_cap()
     test_feed_owner_override_is_per_feed_and_off_by_default()
+    test_min_topic_affinity_floor_drops_offtopic_authors()
     test_engagement_snapshots_schema()
     test_snapshot_engagements_write_throttle_prune()
     test_select_trending_two_track_interleave()
