@@ -3489,6 +3489,47 @@ def render_feed_card(cfg, f):
     return "".join(parts)
 
 
+def _age_gate(cfg):
+    """Is this deployment one that must declare itself adult before showing its pages?
+
+    Off unless the config says otherwise: the engine serves several deployments and only some of them are adult. The copy
+    lives in the deployment's own config, because a shared engine cannot know what a host is for.
+    """
+    gate = (cfg or {}).get("age_gate") or {}
+    return bool(gate.get("enabled"))
+
+
+def render_age_gate(next_path="/"):
+    """The declaration a stranger meets at "/" (W8 §9: an age gate on every adult product).
+
+    Rendered *instead of* the page, not over it: content that arrives behind an overlay has been sent. The cookie is the
+    whole mechanism — this is a self-declaration and the copy says so, because nothing here can check who anyone is.
+    """
+    e = html.escape
+    target = next_path if next_path.startswith("/") and not next_path.startswith("//") else "/"
+    return f"""<!doctype html>
+<html lang="es">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Antes de continuar</title>
+<style>
+ body{{margin:0;background:#0d0d10;color:#ececf1;font:16px/1.5 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}}
+ main{{max-width:34rem;padding:2rem}}
+ h1{{font-size:1.4rem;margin:0 0 1rem}}
+ p{{margin:0 0 1rem}}
+ .fine{{color:#9a9aa5;font-size:.9rem}}
+ a.btn{{display:inline-block;margin:0 1rem 1rem 0;padding:.7rem 1.2rem;border-radius:.5rem;background:#ececf1;color:#0d0d10;text-decoration:none;font-weight:600}}
+ a.alt{{color:#9a9aa5}}
+</style></head>
+<body><main>
+<h1>Este sitio contiene material para adultos</h1>
+<p>BNWO feeds reúne y ordena publicaciones para adultos. Confirma que tienes 18 años o más para continuar.</p>
+<p class="fine">Es una declaración propia, no una verificación de edad: aquí no se comprueba quién eres — solo se anota que
+dijiste tener la edad, y se vuelve a preguntar en 30 días.</p>
+<p><a class="btn" href="/age/accept?next={e(target)}">Tengo 18 años o más</a>
+<a class="alt" href="https://docs.polarisocial.xyz/legal/acceptable-use/">Qué se permite aquí</a></p>
+</main></body></html>""".encode()
+
+
 def render_index_page(cfg):
     """The public page at "/": what this deployment serves, and what each feed is for."""
     e = html.escape
@@ -3827,6 +3868,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
+
+        # The age declaration (W8 §9). The human pages render the gate instead of themselves until the cookie is present;
+        # the xrpc, .well-known, health and metrics endpoints above and below are read by machines and are never gated.
+        if u.path == "/age/accept":
+            nxt = (q.get("next", ["/"])[0] or "/")
+            if not nxt.startswith("/") or nxt.startswith("//"):
+                nxt = "/"
+            return self._send(303, b"", "text/plain", headers={
+                "Location": nxt,
+                "Set-Cookie": "bnwo_age=1; Path=/; Max-Age=2592000; Secure; SameSite=Lax",
+            })
+        if _age_gate(CFG) and u.path in ("/", "/people", "/stats", "/taste", "/quiz", "/why", "/also-liked") \
+                and "bnwo_age=1" not in (self.headers.get("Cookie") or ""):
+            return self._send(200, render_age_gate(u.path), "text/html",
+                              headers={"Cache-Control": "no-store"})
 
         if u.path == "/.well-known/did.json":
             return self._send(200, {
