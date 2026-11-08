@@ -280,6 +280,17 @@ CREATE TABLE IF NOT EXISTS served_daily (
     PRIMARY KEY (feed_rkey, day)
 );
 
+-- One row per reader per day: the durable head count behind /stats.
+-- served_posts cannot answer "how many people read us on day D" because its
+-- primary key is (reader, post): re-serving the same post REWRITEs the row's
+-- served_at, so old days lose readers as posts cycle. This table is written
+-- once per serve and never rewritten. Aggregate-only reads; no post, no feed.
+CREATE TABLE IF NOT EXISTS requester_daily (
+    day           TEXT NOT NULL,
+    requester_did TEXT NOT NULL,
+    PRIMARY KEY (day, requester_did)
+);
+
 CREATE TABLE IF NOT EXISTS author_topic (
     author_did  TEXT PRIMARY KEY,
     topic_posts    INTEGER DEFAULT 0,
@@ -2053,6 +2064,12 @@ def log_served_posts(requester_did, rkey, uris):
             "INSERT OR REPLACE INTO served_posts(requester_did, post_uri, "
             "feed_rkey, served_at, polled_at) VALUES (?,?,?,?,0)",
             [(requester_did, uri, rkey, now) for uri in uris])
+        # Durable per-day head count (see the requester_daily schema comment):
+        # one row per reader per day, never rewritten, so "people served" is
+        # exact and does not decay as posts cycle through served_posts.
+        db().execute(
+            "INSERT OR IGNORE INTO requester_daily(day, requester_did) "
+            "VALUES(date(?, 'unixepoch'), ?)", (now, requester_did))
 
 
 def user_excluded_uris(requester_did, include_seen=False, protect_did=None):
@@ -3384,51 +3401,251 @@ def render_quiz_page(cfg):
     return _page("Quiz de gusto", body, "Sin scripts, sin recursos externos.")
 
 
+def backfill_requester_daily():
+    """Give `requester_daily` the history `served_posts` still holds.
+
+    One-shot: runs only while the table is empty. Best-effort by nature —
+    `served_posts` keeps ~30 days and rewrites a row when the same reader is
+    served the same post again, so an old day can be missing a reader that was
+    only ever served posts it saw again later. From the moment this shipped the
+    counts are exact.
+    """
+    try:
+        with DB_LOCK:
+            if db().execute("SELECT COUNT(*) FROM requester_daily").fetchone()[0]:
+                return 0
+            cur = db().execute(
+                "INSERT OR IGNORE INTO requester_daily(day, requester_did) "
+                "SELECT date(served_at, 'unixepoch'), requester_did "
+                "FROM served_posts")
+            return cur.rowcount or 0
+    except sqlite3.Error as e:
+        print(f"[{SVC_TAG}] requester_daily backfill failed: {e}", flush=True)
+        return 0
+
+
+def stats_payload(days=14, weeks=8, now_ts=None):
+    """Every figure behind /stats — counts and means, never an identifier.
+
+    Honest limits, repeated to the reader on the page itself:
+      * a reader exists only when the skeleton request carried a verified JWT;
+        anonymous traffic cannot be attributed to anybody;
+      * `requester_daily` is exact from the day it shipped; earlier days are
+        backfilled from the retained part of `served_posts`;
+      * interaction events are counted when the poller observes them, so a like
+        lands on the day we saw it, not necessarily the day it happened;
+      * "serves" means distinct (reader, post) pairs — the same base
+        `likes_per_1k` divides by, so the page agrees with /metrics.json.
+    """
+    now_ts = time.time() if now_ts is None else now_ts
+    today = datetime.fromtimestamp(now_ts, timezone.utc).date()
+
+    def day(i):
+        return (today - timedelta(days=i)).isoformat()
+
+    def one(sql, args=()):
+        try:
+            row = db().execute(sql, args).fetchone()
+            return row[0] if row and row[0] is not None else 0
+        except sqlite3.Error:
+            return 0
+
+    def pairs(sql, args=()):
+        try:
+            return {r[0]: r[1] for r in db().execute(sql, args).fetchall()}
+        except sqlite3.Error:
+            return {}
+
+    out = {
+        "generated_at": now_ts,
+        "readers": {
+            "today": one("SELECT COUNT(DISTINCT requester_did) "
+                         "FROM requester_daily WHERE day = ?", (day(0),)),
+            "d7": one("SELECT COUNT(DISTINCT requester_did) "
+                      "FROM requester_daily WHERE day >= ?", (day(6),)),
+            "d30": one("SELECT COUNT(DISTINCT requester_did) "
+                       "FROM requester_daily WHERE day >= ?", (day(29),)),
+            "total": one("SELECT COUNT(DISTINCT requester_did) "
+                         "FROM requester_daily"),
+            "rolling24h": one("SELECT COUNT(DISTINCT requester_did) "
+                              "FROM served_posts WHERE served_at > ?",
+                              (now_ts - 86400,)),
+            "new_d7": one("SELECT COUNT(*) FROM (SELECT requester_did, "
+                          "MIN(day) AS f FROM requester_daily "
+                          "GROUP BY requester_did) WHERE f >= ?", (day(6),)),
+        },
+        "serves_total": one("SELECT COUNT(*) FROM served_posts"),
+        "corpus": {
+            "posts": one("SELECT COUNT(*) FROM posts"),
+            "authors": one("SELECT COUNT(DISTINCT author_did) FROM posts"),
+        },
+        "updated": max(0.0, now_ts - float((CACHE.get("updated") or 0))),
+    }
+
+    rd = pairs("SELECT day, COUNT(*) FROM requester_daily GROUP BY day")
+    sv = pairs("SELECT date(served_at, 'unixepoch'), COUNT(*) FROM served_posts "
+               "GROUP BY 1")
+    lk = pairs("SELECT date(created_at, 'unixepoch'), COUNT(*) "
+               "FROM interaction_events WHERE kind = 'like' GROUP BY 1")
+    out["daily"] = [{"day": day(i), "readers": rd.get(day(i), 0),
+                     "serves": sv.get(day(i), 0), "likes": lk.get(day(i), 0)}
+                    for i in range(int(days) - 1, -1, -1)]
+
+    rw = pairs("SELECT strftime('%Y-%W', day), "
+               "COUNT(DISTINCT requester_did) FROM requester_daily GROUP BY 1")
+    sw = pairs("SELECT strftime('%Y-%W', date(served_at, 'unixepoch')), "
+               "COUNT(*) FROM served_posts GROUP BY 1")
+    lw = pairs("SELECT strftime('%Y-%W', date(created_at, 'unixepoch')), "
+               "COUNT(*) FROM interaction_events WHERE kind = 'like' GROUP BY 1")
+    monday = today - timedelta(days=today.weekday())
+    out["weekly"] = []
+    for i in range(int(weeks) - 1, -1, -1):
+        start = monday - timedelta(days=7 * i)
+        key = start.strftime("%Y-%W")
+        out["weekly"].append({"week_start": start.isoformat(),
+                              "readers": rw.get(key, 0),
+                              "serves": sw.get(key, 0),
+                              "likes": lw.get(key, 0)})
+
+    out["feeds"] = likes_per_1k(7, now_ts)
+    out["kinds"] = pairs("SELECT kind, COUNT(*) FROM interaction_events "
+                         "GROUP BY kind")
+    out["feeds_per_reader"] = pairs(
+        "SELECT c, COUNT(*) FROM (SELECT requester_did, "
+        "COUNT(DISTINCT feed_rkey) AS c FROM served_posts WHERE served_at > ? "
+        "GROUP BY requester_did) GROUP BY c", (now_ts - 7 * 86400,))
+    return out
+
+
 def render_stats_page(cfg):
     """/stats: public proof, AGGREGATE ONLY. No per-requester identifier.
 
     Every figure here is a count or a mean over a whole deployment. The page
     deliberately does not link to /taste or /people, because those are per-person
     and a "statistics" page that quietly exposes them is not a statistics page.
+    Reader figures come from `requester_daily` (one row per reader per day,
+    written at serve time) so "people served on day D" stays true as posts
+    cycle; see `stats_payload` for the limits this page states to the reader.
     """
     e = html.escape
     try:
-        depth = {f["rkey"]: len(CACHE["feeds"].get(f["rkey"], [])) for f in cfg["feeds"]}
+        st = stats_payload()
+    except Exception as err:                                   # noqa: BLE001
+        print(f"[{SVC_TAG}] stats payload failed: {err}", flush=True)
+        st = {"readers": {}, "daily": [], "weekly": [], "feeds": {},
+              "kinds": {}, "feeds_per_reader": {}, "corpus": {},
+              "serves_total": 0, "updated": 0.0}
+
+    try:
+        depth = {f["rkey"]: len(CACHE["feeds"].get(f["rkey"], []))
+                 for f in cfg["feeds"]}
     except Exception:                                          # noqa: BLE001
         depth = {f["rkey"]: 0 for f in cfg["feeds"]}
-    try:
-        with CACHE_LOCK:
-            rq24 = db().execute(
-                "SELECT COUNT(DISTINCT requester_did) FROM served_posts "
-                "WHERE served_at > ?", (time.time() - 86400,)).fetchone()[0] or 0
-            served = db().execute("SELECT COUNT(*) FROM served_posts").fetchone()[0]
-            posts_n = db().execute("SELECT COUNT(*) FROM posts").fetchone()[0]
-            authors = db().execute(
-                "SELECT COUNT(DISTINCT author_did) FROM posts").fetchone()[0]
-        updated = time.time() - float(CACHE.get("updated") or 0)
-    except sqlite3.Error:
-        rq24 = served = posts_n = authors = 0
-        updated = 0
-    try:
-        member_n = (CACHE.get("members") or 0)
-    except Exception:                                          # noqa: BLE001
-        member_n = 0
-    rows = "".join(f"<tr><td>{e(rk)}</td><td>{n}</td></tr>"
-                   for rk, n in sorted(depth.items()))
-    mins = int(updated // 60)
+
+    def table(headers, rows):
+        head = "".join(f"<th>{e(str(h))}</th>" for h in headers)
+        body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>"
+                       for row in rows)
+        return f"<table><tr>{head}</tr>{body}</table>"
+
+    r = st.get("readers") or {}
+    corpus = st.get("corpus") or {}
+    upd = float(st.get("updated") or 0)
+    updated_txt = f"hace {int(upd // 60)} min" if upd > 0 \
+        else "sin refresco registrado"
+
+    vol_rows = [
+        ("personas distintas hoy", r.get("today", 0)),
+        ("personas distintas en los ultimos 7 dias", r.get("d7", 0)),
+        ("personas distintas en los ultimos 30 dias", r.get("d30", 0)),
+        ("personas distintas desde el inicio", r.get("total", 0)),
+        ("lectores nuevos en los ultimos 7 dias", r.get("new_d7", 0)),
+        ("lectores en las ultimas 24 horas (ventana movil)",
+         r.get("rolling24h", 0)),
+        ("entregas distintas acumuladas", st.get("serves_total", 0)),
+        ("posts en el corpus", corpus.get("posts", 0)),
+        ("autores distintos", corpus.get("authors", 0)),
+        ("feeds configurados", len(cfg.get("feeds") or [])),
+        ("ultima actualizacion", updated_txt),
+    ]
+    vol = table(("Medida", "Valor"),
+                [(e(str(k)), f"<b>{v}</b>") for k, v in vol_rows])
+
+    daily = table(("Dia (UTC)", "Personas", "Entregas", "Me gusta"),
+                  [(e(d["day"]), d["readers"], d["serves"], d["likes"])
+                   for d in st.get("daily") or []])
+    weekly = table(("Semana desde", "Personas", "Entregas", "Me gusta"),
+                   [(e(w["week_start"]), w["readers"], w["serves"], w["likes"])
+                    for w in st.get("weekly") or []])
+
+    kinds = st.get("kinds") or {}
+    kind_names = [("like", "me gusta"), ("repost", "repost"),
+                  ("reply", "respuesta"), ("less", "no me interesa"),
+                  ("seen", "vistos (marcas del cliente)")]
+    kind_rows = [(e(label), kinds.get(key, 0))
+                 for key, label in kind_names] + \
+                [(e(k), v) for k, v in sorted(kinds.items())
+                 if k not in dict(kind_names)]
+    kinds_tbl = table(("Tipo de interaccion (observada)", "Eventos"),
+                      kind_rows)
+
+    fl = st.get("feeds") or {}
+    serves7 = sum(int(v.get("serves") or 0) for v in fl.values())
+    likes7 = sum(int(v.get("likes") or 0) for v in fl.values())
+    per1k7 = round(1000.0 * likes7 / serves7, 1) if serves7 else 0.0
+    feed_rows = []
+    all_rk = set(fl) | set(depth)
+    for rk in sorted(all_rk, key=lambda k: (-(fl.get(k, {}).get("serves") or 0),
+                                            k)):
+        v = fl.get(rk) or {}
+        feed_rows.append((e(str(rk)), depth.get(rk, 0), v.get("requesters", 0),
+                          v.get("serves", 0), v.get("likes", 0),
+                          v.get("per_1k", 0.0)))
+    feeds_tbl = table(("Feed", "en cola", "personas", "entregas",
+                       "me gusta", "por 1k"), feed_rows)
+
+    hist = st.get("feeds_per_reader") or {}
+    one_feed = int(hist.get(1, 0))
+    two = int(hist.get(2, 0))
+    three = sum(int(v) for k, v in hist.items() if k not in (1, 2))
+    reach = table(("Feeds leidos por una persona (7 dias)", "Personas"),
+                  [("1 feed", one_feed), ("2 feeds", two),
+                   ("3 feeds o mas", three)])
+
     body = (
         "<h1>Como esta funcionando</h1>"
         "<p class='lede'>Cuentas agregadas, sin datos de ninguna persona.</p>"
-        "<h2>Volumen</h2>"
-        f"<table><tr><th>Medida</th><th>Valor</th></tr>"
-        f"<tr><td>personas distintas servidas en 24h</td><td>{rq24}</td></tr>"
-        f"<tr><td>posts entregados (hist&oacute;rico)</td><td>{served}</td></tr>"
-        f"<tr><td>posts en el corpus</td><td>{posts_n}</td></tr>"
-        f"<tr><td>autores distintos</td><td>{authors}</td></tr>"
-        f"<tr><td>integrantes de la lista</td><td>{member_n}</td></tr>"
-        f"<tr><td>ultima actualizacion</td><td>hace {mins} min</td></tr></table>"
-        "<h2>Profundidad por feed</h2>"
-        f"<table><tr><th>Feed</th><th>posts en la cola</th></tr>{rows}</table>")
+        "<h2>Lectores y volumen</h2>" + vol +
+        f"<h2>Por dia (ultimos {len(st.get('daily') or [])} dias)</h2>" + daily +
+        f"<h2>Por semana (ultimas {len(st.get('weekly') or [])} semanas)</h2>" +
+        weekly +
+        "<h2>Interaccion</h2>" + kinds_tbl +
+        f"<p>En los ultimos 7 dias: <b>{likes7}</b> me gusta acreditados "
+        f"sobre <b>{serves7}</b> entregas distintas "
+        f"(<b>{per1k7}</b> por cada 1.000).</p>" +
+        "<h2>Por feed (7 dias)</h2>" + feeds_tbl +
+        "<h2>Alcance</h2>" + reach +
+        "<h2>Como leer estas cifras</h2>"
+        "<ul>"
+        "<li><b>Personas</b>: lectores distintos con sesion verificada por la "
+        "app de Bluesky. El trafico anonimo no se puede atribuir y no cuenta."
+        "</li>"
+        "<li><b>Entregas</b>: pares distintos (persona, post). Volver a servir "
+        "el mismo post a la misma persona no suma otra vez, asi que una entrega "
+        "no es una vista.</li>"
+        "<li><b>Me gusta</b>: se cuentan cuando el sondeo los observa (hasta "
+        "24 h de retraso) y solo se acreditan a un feed si esa persona recibio "
+        "ese post de ese feed. Es una medida conservadora, pensada para "
+        "comparar feeds entre si.</li>"
+        "<li>Los recuentos de personas por dia son exactos desde que existe el "
+        "registro diario; los dias anteriores se reconstruyeron con lo que "
+        "quedaba del detalle, que se conserva 30 dias.</li>"
+        "<li>Las <b>entregas</b> por dia salen de ese detalle: al volver a "
+        "servir un post a la misma persona la fila se reescribe, asi que un dia "
+        "antiguo puede quedar corto. Los me gusta no dependen de eso.</li>"
+        "<li>Ninguna cifra de esta pagina identifica a una persona ni enlaza a "
+        "su perfil.</li>"
+        "</ul>")
     return _page("Estadisticas", body,
                  "Agregados unicamente: ninguna cuenta individual aparece aqui.")
 
@@ -4481,6 +4698,10 @@ def warm_start():
 def main():
     migrate_legacy_state()
     migrate_schema()
+    filled = backfill_requester_daily()
+    if filled:
+        print(f"[{SVC_TAG}] /stats: requester_daily backfilled "
+              f"({filled} reader-days from retained served_posts)", flush=True)
     if kw_enabled():
         print(f"[{SVC_TAG}] keyword weights seeded ({kw_init()} new)", flush=True)
     threading.Thread(target=warm_start, daemon=True).start()

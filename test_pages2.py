@@ -91,8 +91,57 @@ def test_stats_is_aggregate_only():
     _no_external(html)
     assert "did:plc:" not in html, "a DID leaked onto the public stats page"
     assert "personas distintas" in html
-    assert "Profundidad por feed" in html or "profundidad" in html.lower()
-    print("ok   /stats is aggregate only: no did:plc: anywhere")
+    for section in ("Lectores y volumen", "Por dia", "Por semana",
+                    "Interaccion", "Por feed", "Como leer estas cifras"):
+        assert section in html, f"/stats lost its {section!r} section"
+    print("ok   /stats is aggregate only, with day/week/feed/interaction sections")
+
+
+def test_stats_counts_readers_per_day_and_likes():
+    """The per-day reader count must come from requester_daily (one row per
+    reader per day, never rewritten). A head count read from served_posts
+    decays silently: that table's key is (reader, post), so re-serving the same
+    post to the same reader REWRITES served_at and the old day loses the reader.
+    Likes are counted from the events the poller observed.
+    """
+    today = fg.datetime.fromtimestamp(time.time(), fg.timezone.utc).date()
+    day0 = today.isoformat()
+    day1 = (today - fg.timedelta(days=1)).isoformat()
+    for did, day in (("did:plc:statsa", day0), ("did:plc:statsb", day0),
+                     ("did:plc:statsc", day1)):
+        fg.db().execute("INSERT OR REPLACE INTO requester_daily"
+                        "(day, requester_did) VALUES(?,?)", (day, did))
+    fg.db().execute("INSERT INTO interaction_events(post_uri, feed_rkey, kind, "
+                    "created_at, requester_did) VALUES(?,?,?,?,?)",
+                    ("at://did:plc:x/app.bsky.feed.post/stat", "f",
+                     "like", time.time(), "did:plc:statsa"))
+    st = fg.stats_payload()
+    assert st["readers"]["today"] >= 2, st["readers"]
+    assert st["readers"]["d7"] >= 3, st["readers"]
+    assert st["daily"][-1]["day"] == day0, st["daily"][-1]
+    assert st["daily"][-1]["readers"] >= 2, st["daily"][-1]
+    assert st["daily"][-1]["likes"] >= 1, st["daily"][-1]
+    assert len(st["daily"]) == 14 and len(st["weekly"]) == 8
+    assert sum(w["readers"] for w in st["weekly"]) >= 3, st["weekly"]
+    html = _html(fg.render_stats_page(fg.CFG))
+    assert day0 in html and "Por dia" in html
+    assert "did:plc:" not in html
+    print("ok   /stats counts people per day from requester_daily, and likes/day")
+
+
+def test_serving_path_records_the_reader_day():
+    """log_served_posts is what the skeleton endpoint calls. If it does not
+    leave the durable per-day row, every reader figure on /stats goes quiet
+    over time while the page keeps rendering."""
+    did = "did:plc:servepath"
+    day0 = fg.datetime.fromtimestamp(time.time(), fg.timezone.utc).date().isoformat()
+    fg.db().execute("DELETE FROM requester_daily WHERE requester_did=?", (did,))
+    fg.log_served_posts(did, "probe",
+                        ["at://did:plc:a/app.bsky.feed.post/served1"])
+    n = fg.db().execute("SELECT COUNT(*) FROM requester_daily WHERE "
+                        "requester_did=? AND day=?", (did, day0)).fetchone()[0]
+    assert n == 1, n
+    print("ok   serving a page records the reader-day that /stats counts")
 
 
 def test_taste_without_identity_is_a_200_explainer():
