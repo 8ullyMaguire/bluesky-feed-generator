@@ -2073,9 +2073,14 @@ def user_excluded_uris(requester_did, include_seen=False, protect_did=None):
         so a heavy scroller cannot exclude every board at once; the
         `hide_min_board` floor is the second guard.
 
-    `protect_did` (callers pass CFG["owner"]["did"]) is never excluded: the
-    owner's own posts must keep appearing in the owner's feeds at their
-    configured ratio, no matter how often they saw or liked them.
+    `protect_did` (callers pass CFG["owner"]["did"]) is never excluded for
+    OTHER requesters: the owner's own posts must keep appearing in other
+    people's feeds at their configured ratio, however often those readers saw
+    or liked them. The owner reading their own feeds is a reader like any
+    other — a post they already saw or liked is a repeat for THEM — so the
+    carve-out is dropped when the requester IS the protected DID, and the
+    owner's own posts are hidden from the owner for good once served
+    (`hide_seen_ttl_h` bounds everyone else's seen memory, not this).
     """
     if not requester_did:
         return set()
@@ -2085,6 +2090,11 @@ def user_excluded_uris(requester_did, include_seen=False, protect_did=None):
             "UNION SELECT post_uri FROM user_hidden WHERE requester_did=?",
             (requester_did, requester_did)).fetchall():
         out.add(uri)
+    # The owner browsing their own feeds is a reader like any other: a post
+    # they already saw or liked is a repeat FOR THEM. `protect_did` exists so
+    # owner content keeps reaching OTHER readers at owner.max_ratio, not so
+    # the owner's own repeats are pinned onto their boards.
+    own_read = bool(protect_did) and protect_did == requester_did
     if include_seen:
         ttl_h = CFG.get("hide_seen_ttl_h", 24) or 24
         cutoff = time.time() - ttl_h * 3600
@@ -2094,6 +2104,18 @@ def user_excluded_uris(requester_did, include_seen=False, protect_did=None):
                 "SELECT post_uri FROM served_posts WHERE requester_did=? "
                 "AND served_at >= ?", (requester_did, cutoff)).fetchall():
             out.add(uri)
+        if own_read:
+            # The owner's OWN posts never come back once served, TTL or not:
+            # "stop showing me my own post" outranks the TTL that keeps a
+            # heavy scroller from draining a board.
+            for (uri,) in db().execute(
+                    "SELECT sp.post_uri FROM served_posts sp "
+                    "JOIN posts p ON p.uri = sp.post_uri "
+                    "WHERE sp.requester_did=? AND p.author_did=?",
+                    (requester_did, protect_did)).fetchall():
+                out.add(uri)
+    if own_read:
+        protect_did = None
     if protect_did and out:
         # Unknown-author URIs stay excluded; only known owner posts are
         # carved back out (chunked: SQLite's variable limit is 999).
@@ -2107,7 +2129,23 @@ def user_excluded_uris(requester_did, include_seen=False, protect_did=None):
     return out
 
 
-def apply_user_exclusions(picks, excluded, hard_hide=False, min_board=20):
+def author_of_uris(uris):
+    """Map each URI in `uris` to its author DID (chunked: SQLite's variable
+    limit is 999). Unknown URIs are absent from the result."""
+    out = {}
+    lst = list(uris)
+    for i in range(0, len(lst), 400):
+        chunk = lst[i:i + 400]
+        ph = ",".join("?" * len(chunk))
+        for uri, did in db().execute(
+                f"SELECT uri, author_did FROM posts WHERE uri IN ({ph})",
+                chunk).fetchall():
+            out[uri] = did
+    return out
+
+
+def apply_user_exclusions(picks, excluded, hard_hide=False, min_board=20,
+                          never=None):
     """Remove `excluded` URIs from a board.
 
     hard_hide=False (the top/window feeds) keeps the historical behaviour:
@@ -2119,12 +2157,18 @@ def apply_user_exclusions(picks, excluded, hard_hide=False, min_board=20):
     global and finite; without this floor a heavy user could drain the feed
     to nothing (the exact regression that killed the first permanent-seen
     attempt), so keep the floor low but non-zero.
+
+    `never` is a subset that is dropped in both the ordering and the
+    starvation fallback: the owner's own already-seen posts, because "stop
+    showing me my own post" must not be undone by a floor meant for content
+    the user has not written.
     """
-    if not excluded or not picks:
+    never = set(never or ())
+    if (not excluded and not never) or not picks:
         return list(picks)
-    kept = [p for p in picks if p not in excluded]
+    kept = [p for p in picks if p not in excluded and p not in never]
     if not hard_hide or len(kept) < int(min_board):
-        return kept + [p for p in picks if p in excluded]
+        return kept + [p for p in picks if p in excluded and p not in never]
     return kept
 
 
@@ -3945,7 +3989,10 @@ class Handler(BaseHTTPRequestHandler):
             # across all of this deployment's feeds, bounded by hide_seen_ttl_h.
             # All reads are local; user_likes is kept warm in the background
             # by refresh_all_requester_likes(). Owner-authored posts are
-            # never excluded, so the owner's own posts keep their ratio.
+            # protected from OTHER readers' exclusions so they keep their
+            # ratio; the owner reading their own feed gets them hidden like
+            # any other repeat (user_excluded_uris drops the carve-out when
+            # the requester is the owner).
             hide_seen = bool(FEEDS[uri].get("hide_seen", 0))
             excluded = set()
             if requester_did:
@@ -3953,10 +4000,22 @@ class Handler(BaseHTTPRequestHandler):
                     requester_did, hide_seen,
                     protect_did=(CFG.get("owner") or {}).get("did"))
 
-            if excluded:
+            # The owner's own repeats are dropped even past the starvation
+            # floor: a floor exists so a heavy reader is not starved of OTHER
+            # people's posts, not to hand the owner back their own post.
+            owner_did = (CFG.get("owner") or {}).get("did")
+            own_repeats = set()
+            if requester_did and owner_did and requester_did == owner_did \
+                    and excluded:
+                board_repeats = [p for p in picks if p in excluded]
+                authors = author_of_uris(board_repeats)
+                own_repeats = {u for u, a in authors.items() if a == owner_did}
+
+            if excluded or own_repeats:
                 picks = apply_user_exclusions(
                     picks, excluded, hard_hide=hide_seen,
-                    min_board=CFG.get("hide_min_board", 20))
+                    min_board=CFG.get("hide_min_board", 20),
+                    never=own_repeats)
 
             # Per-user personalization (serve-time re-rank + exploration slots)
             if requester_did:

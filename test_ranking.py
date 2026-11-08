@@ -585,24 +585,69 @@ def test_seen_memory_is_shared_across_service_feeds():
 
 
 def test_user_excluded_uris_protects_owner_posts():
-    """The owner's own posts are never excluded for the owner (or anyone):
-    the feed keeps serving them at the configured owner ratio."""
+    """Owner posts are protected from OTHER readers' exclusions — the feeds
+    must keep serving them at the configured owner ratio — while the owner
+    reading their own feeds is a reader like any other: a post they already
+    saw or liked is a repeat for THEM, and their own posts never come back
+    once served, however old that serve is.
+    """
     if not hasattr(fg, "user_excluded_uris"):
         print("ok   user_excluded_uris absent in this module (skipped)")
         return
     now = time.time()
     owner = fg.CFG["owner"]["did"]
+    reader = "did:plc:ownerprotectreader"
     mine = "at://did:plc:ownerpost/app.bsky.feed.post/mine"
+    old_seen = "at://did:plc:ownerpost/app.bsky.feed.post/old-seen"
+    ttl = fg.CFG.get("hide_seen_ttl_h", 24) or 24
     db_insert_post(mine, owner)
-    fg.db().execute("DELETE FROM user_likes WHERE requester_did=?", (owner,))
-    fg.db().execute("DELETE FROM user_hidden WHERE requester_did=?", (owner,))
+    db_insert_post(old_seen, owner)
+    for did in (owner, reader):
+        for table in ("user_likes", "user_hidden", "served_posts"):
+            fg.db().execute("DELETE FROM %s WHERE requester_did=?" % table,
+                            (did,))
     fg.db().execute("INSERT INTO user_likes VALUES(?,?,?)", (owner, mine, now))
     fg.db().execute("INSERT INTO user_hidden VALUES(?,?,?,?)",
                     (owner, mine, "less", now))
-    assert fg.user_excluded_uris(owner, True, owner) == set()
-    unprotected = fg.user_excluded_uris(owner, True, None)
-    assert mine in unprotected, unprotected
-    print("ok   owner-authored posts are never excluded when protect_did is set")
+    # Served to the owner longer ago than hide_seen_ttl_h: still a repeat.
+    fg.db().execute("INSERT INTO served_posts VALUES(?,?,?,?,0)",
+                    (owner, old_seen, "probe", now - (ttl + 1) * 3600))
+    got = fg.user_excluded_uris(owner, True, owner)
+    assert mine in got, got
+    assert old_seen in got, got
+    # A different reader who liked / was served the same owner posts still
+    # gets them: the owner ratio is what feeds other people.
+    fg.db().execute("INSERT INTO user_likes VALUES(?,?,?)", (reader, mine, now))
+    fg.db().execute("INSERT INTO served_posts VALUES(?,?,?,?,0)",
+                    (reader, old_seen, "probe", now - 3600))
+    assert fg.user_excluded_uris(reader, True, owner) == set()
+    print("ok   owner posts protected for other readers, hidden as the "
+          "owner's own repeats")
+
+
+def test_owner_repeats_survive_the_starvation_floor():
+    """The owner's own already-seen posts are dropped from the board even
+    when the floor would otherwise re-append the excluded posts: the floor
+    exists so a heavy reader is not starved of other people's content."""
+    if not hasattr(fg, "apply_user_exclusions") or \
+            not hasattr(fg, "author_of_uris"):
+        print("ok   exclusion helpers absent in this module (skipped)")
+        return
+    owner = fg.CFG["owner"]["did"]
+    mine = "at://did:plc:ownerpost/app.bsky.feed.post/floor-own"
+    theirs = "at://did:plc:someone/app.bsky.feed.post/floor-other"
+    db_insert_post(mine, owner)
+    db_insert_post(theirs, "did:plc:someone")
+    authors = fg.author_of_uris([mine, theirs])
+    assert authors.get(mine) == owner, authors
+    board = [mine, theirs]
+    got = fg.apply_user_exclusions(board, {mine, theirs}, hard_hide=True,
+                                   min_board=20, never={mine})
+    assert mine not in got, got
+    assert got == [theirs], got
+    # `never` alone (nothing else excluded) still drops the post
+    assert fg.apply_user_exclusions(board, set(), never={mine}) == [theirs]
+    print("ok   owner's own repeats are dropped past the starvation floor")
 
 
 def test_apply_user_exclusions_tail_vs_hard_hide():
@@ -778,6 +823,7 @@ if __name__ == "__main__":
     test_user_excluded_uris_unions_likes_and_hidden()
     test_seen_memory_is_shared_across_service_feeds()
     test_user_excluded_uris_protects_owner_posts()
+    test_owner_repeats_survive_the_starvation_floor()
     test_apply_user_exclusions_tail_vs_hard_hide()
     test_extract_terms_and_negative_penalty()
     test_less_event_hides_post_and_sinks_author()
