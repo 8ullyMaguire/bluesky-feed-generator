@@ -124,6 +124,46 @@ def test_select_owner_ratio_cap():
     print(f"ok  owner ratio cap holds ({n_own}/{len(uris)} owner posts)")
 
 
+def test_feed_owner_override_is_per_feed_and_off_by_default():
+    """A feed may opt out of the owner boost/inclusion with its own `owner`
+    block; a feed without one must rank exactly as before. The generic feed
+    depends on this: "do not push my content" is a per-feed decision."""
+    base = {"did": "did:plc:own", "always_include": True, "boost": 1.3,
+            "bonus": 3.0, "max_ratio": 0.33}
+    assert fg.feed_owner(base, {}) == base, "absent feed block must change nothing"
+    got = fg.feed_owner(base, {"owner": {"always_include": False,
+                                         "boost": 1.0, "bonus": 0.0,
+                                         "max_ratio": 0}})
+    assert got["always_include"] is False and got["max_ratio"] == 0, got
+    assert got["did"] == base["did"], "the DID must survive the override"
+    assert base["always_include"] is True, "the deployment block must not be mutated"
+
+    owner_did = base["did"]
+    posts = [post(likes=0, did=owner_did, key=f"q{i}") for i in range(4)]
+    posts += [post(likes=40, did=f"did:plc:u{i}", key=f"v{i}") for i in range(6)]
+    fcfg = {"rkey": "t", "max_posts": 100, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24}
+    forced, _ = fg.select(posts, fcfg, NOW, base, CTX, set())
+    plain, _ = fg.select(posts, fcfg, NOW,
+                         fg.feed_owner(base, {"owner": {"always_include": False,
+                                                        "boost": 1.0, "bonus": 0.0,
+                                                        "max_ratio": 0}}),
+                         CTX, set())
+    furis = [u for u, _s in forced]
+    puris = [u for u, _s in plain]
+    # Baseline: boosted and interleaved — an owner post lands in the first 3.
+    assert any(u.startswith(f"at://{owner_did}/") for u in furis[:3]), furis
+    # Override: still eligible (nothing is banned), but ranked on its own
+    # engagement and with no interleave, so it sinks to the tail. "Do not push
+    # my content" = present, never promoted.
+    n_plain = sum(1 for u in puris if u.startswith(f"at://{owner_did}/"))
+    assert n_plain == 4, (n_plain, puris)
+    first_own = min(i for i, u in enumerate(puris) if u.startswith(f"at://{owner_did}/"))
+    assert first_own == 6, puris
+    print(f"ok  per-feed owner block: owner post in top 3 when pushed, "
+          f"{n_plain} eligible but starting at position {first_own} without it")
+
+
 def test_snapshot_engagements_write_throttle_prune():
     con = fg.db()
     saved = {k: fg.CFG.get(k) for k in ("snapshot_interval_hours",
@@ -804,6 +844,7 @@ if __name__ == "__main__":
     test_author_prior_multiplies()
     test_select_returns_scored_tuples()
     test_select_owner_ratio_cap()
+    test_feed_owner_override_is_per_feed_and_off_by_default()
     test_engagement_snapshots_schema()
     test_snapshot_engagements_write_throttle_prune()
     test_select_trending_two_track_interleave()

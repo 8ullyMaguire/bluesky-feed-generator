@@ -682,6 +682,23 @@ def rank_score(p, fcfg, w, age_h, ctx):
     return s
 
 
+def feed_owner(owner, fcfg):
+    """The owner block a feed ranks with: the deployment-wide one, with the
+    feed's own `owner` keys layered on top.
+
+    A feed that must not promote the owner's posts at all (a generic feed)
+    sets `owner: {"always_include": false, "boost": 1.0, "bonus": 0,
+    "max_ratio": 0}` and gets the owner's posts as ordinary candidates — gated,
+    scored, capped per author like anyone else. A feed WITHOUT the key is
+    exactly the deployment behaviour it was before this existed, which is why
+    this can live in the shared engine.
+    """
+    out = dict(owner or {})
+    if isinstance(fcfg.get("owner"), dict):
+        out.update(fcfg["owner"])
+    return out
+
+
 def select(posts, fcfg, now, owner, ctx, suppressed):
     """Rank the posts for one feed. Returns (uris, stats).
 
@@ -694,6 +711,12 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
     rkey = fcfg["rkey"]
     ttl = fcfg.get("seen_ttl_hours", 24)
     owner_did = (owner or {}).get("did")
+    if owner and not owner.get("always_include"):
+        # This feed does not pin the owner's posts (a generic feed): they are
+        # candidates like anybody else's — gated, scored, capped per author —
+        # and never interleaved. Without this they would fall into
+        # `owner_cands_list`, which nothing reads when max_ratio is 0.
+        owner_did = None
     gate_mode = fcfg.get("gate_mode", "all")
     stats = {"in_window": 0, "pass_share": 0, "pass_gates": 0,
              "suppressed": 0, "final": 0, "owner": 0,
@@ -3076,7 +3099,8 @@ def refresh():
                 "SELECT uri FROM seen WHERE rkey=? AND shown_at > ?",
                 (f["rkey"], now_ts - ttl * 3600)).fetchall()
             suppressed = {r[0] for r in rows}
-        scored, st = select(posts, f, now, owner, ctx, suppressed)
+        scored, st = select(posts, f, now, feed_owner(owner, f), ctx,
+                            suppressed)
         picks[f["rkey"]] = [u for u, _s in scored]
         feed_scores[f["rkey"]] = {u: s for u, s in scored}
         stats[f["rkey"]] = st | {"suppressed_set": len(suppressed), "ttl": ttl}
