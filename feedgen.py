@@ -4724,6 +4724,33 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/":
             return self._send(200, render_index_page(CFG), "text/html")
 
+        if u.path == "/healthz":
+            # The estate's one health shape (ADR 0013): what this process checked, and which version answered.
+            #
+            # The check is the refresh loop, because that is the thing that can be dead while the server still answers --
+            # a feed generator whose crawl stopped serves stale skeletons with a 200 for days. `error` is the loop's own
+            # last failure, and reporting it here is what turns a journal line into a monitorable fact.
+            cycle = float(CFG.get("refresh_secs", 600))
+            with CACHE_LOCK:
+                updated = float(CACHE.get("updated") or 0)
+                feeds_n = len(CACHE.get("feeds") or {})
+                err = CACHE.get("error")
+            if not updated:
+                cache_check = {"name": "cache", "state": "down", "detail": "never refreshed since start"}
+            elif time.time() - updated > cycle * 3:
+                cache_check = {"name": "cache", "state": "degraded",
+                               "detail": "last refresh %ds ago (cycle %ds)" % (time.time() - updated, cycle)}
+            else:
+                cache_check = {"name": "cache", "state": "ok"}
+            checks = [cache_check,
+                      {"name": "feeds", "state": "ok" if feeds_n else "down", "detail": "%d feeds" % feeds_n}]
+            if err:
+                checks.append({"name": "last_refresh", "state": "degraded", "detail": str(err)[:200]})
+            state = "down" if any(c["state"] == "down" for c in checks) else (
+                "degraded" if any(c["state"] == "degraded" for c in checks) else "ok")
+            return self._send(503 if state == "down" else 200,
+                              {"status": state, "version": os.environ.get("ESTATE_VERSION", "0"), "checks": checks})
+
         if u.path in ("/health", "/status"):
             with CACHE_LOCK:
                 snap = {k: v for k, v in CACHE.items()}
