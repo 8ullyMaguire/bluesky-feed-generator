@@ -77,6 +77,14 @@ def settled_final(rows, rkey, ts, horizon=900):
     return last
 
 
+def latest_final(rows):
+    """The board each feed is serving now — the only value that is still a bug."""
+    out = {}
+    for _ts, rkey, _inw, _gate, final in rows:
+        out[rkey] = final or 0
+    return out
+
+
 def group_events(steps, gap_secs=600):
     """Steps within `gap_secs` of each other across >=2 feeds are one event."""
     events = []
@@ -105,6 +113,7 @@ def main(argv=None):
     rows = rows_since(con, since)
     steps = find_steps(rows, args.threshold)
     events = group_events(steps)
+    now_final = latest_final(rows)
 
     report = {"generated": int(time.time()), "hours": args.hours,
               "threshold": args.threshold, "events": []}
@@ -117,9 +126,13 @@ def main(argv=None):
         for f in feeds:
             cap = caps.get(f["feed"]) or 0
             final = settled_final(rows, f["feed"], ev["ts"]) or f["final"] or 0
-            detail.append((f, final, cap, bool(cap) and final >= 0.9 * cap))
+            # Damage is what is *still* missing: a board that has since refilled
+            # is history. Reporting history every hour for the whole window is
+            # how a check earns its way onto the ignore list.
+            healed = bool(cap) and now_final.get(f["feed"], 0) >= 0.9 * cap
+            detail.append((f, final, cap, healed))
         capped = [f["feed"] for f, _fin, _cap, at_cap in detail if at_cap]
-        supply_bound = [f for f, _fin, _cap, at_cap in detail if not at_cap]
+        supply_bound = [f for f, _fin, _cap, healed in detail if not healed]
         kind = "corpus" if len(feeds) >= 3 else "single-feed"
         report["events"].append({
             "ts": ev["ts"],
@@ -128,7 +141,8 @@ def main(argv=None):
             "feeds": [{"feed": f["feed"], "before": f["before"],
                        "after": f["after"], "pct": f["pct"],
                        "settled_final": final, "max_posts": cap,
-                       "capped": at_cap}
+                       "now": now_final.get(f["feed"], 0),
+                       "recovered": at_cap}
                       for f, final, cap, at_cap in detail],
         })
         if supply_bound:
@@ -138,7 +152,7 @@ def main(argv=None):
             len(feeds),
             ", ".join("%s %d->%d (%+d%%) board=%s/%s%s" % (
                 f["feed"], f["before"], f["after"], f["pct"], final, cap or "?",
-                "" if at_cap else " [depth lost]")
+                " recovered" if at_cap else " [depth lost]")
                 for f, final, cap, at_cap in detail)))
 
     if args.json:
@@ -153,7 +167,7 @@ def main(argv=None):
         print("DAMAGE: %d supply-bound board(s) lost depth — check whether the "
               "corpus refilled before blaming the config" % damage)
         return 1
-    print("all drops were on max_posts-capped boards: expected, not damage")
+    print("every drop has since refilled to its cap: history, not damage")
     return 0
 
 
