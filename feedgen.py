@@ -139,6 +139,47 @@ def merge_corpus(posts, max_age_hours):
         d = CORPUS["by_uri"]
     return list(d.values())
 
+
+def seed_corpus_from_db():
+    """Config-gated: refill the rolling corpus from the posts table at start.
+
+    CORPUS is module state, so every restart begins empty and the first cycle
+    ranks a thin incremental crawl (a few hundred posts) while `posts` holds
+    tens of thousands inside the same window. Supply-bound boards then serve a
+    fraction of their depth for hours after a restart. Reading the window back
+    from disk costs seconds and changes only WHEN the corpus is filled, not
+    which posts a feed considers eligible.
+    """
+    c = CFG.get("corpus_seed") or {}
+    if not c.get("enabled"):
+        return 0
+    try:
+        hours = float(c.get("hours") or max(
+            float(f.get("max_age_hours", 48) or 48) for f in CFG["feeds"]))
+        cap = int(c.get("max_posts") or CORPUS_MAX)
+        mod = "-%d hours" % int(round(hours))
+        rows = db().execute(
+            "SELECT record_json FROM posts "
+            "WHERE julianday(indexed_at) > julianday('now', ?) "
+            "ORDER BY julianday(indexed_at) DESC LIMIT ?", (mod, cap)).fetchall()
+        posts = []
+        for (rj,) in rows:
+            try:
+                p = json.loads(rj)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(p, dict) and p.get("uri"):
+                posts.append(p)
+        merge_corpus(posts, hours)
+        n = len(CORPUS["by_uri"])
+        print(f"[{SVC_TAG}] corpus seeded from posts: {len(posts)} rows -> "
+              f"{n} in corpus ({hours:.0f}h window, cap {cap})", flush=True)
+        return n
+    except Exception as e:                            # noqa: BLE001
+        print(f"[{SVC_TAG}] corpus seed failed (starting empty): {e}",
+              flush=True)
+        return 0
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -4929,6 +4970,7 @@ def warm_start():
         print(f"[{SVC_TAG}] serving {sum(len(v) for v in stale.values())} persisted "
               f"picks while warming", flush=True)
     print(f"[{SVC_TAG}] warming cache (first refresh)...", flush=True)
+    seed_corpus_from_db()
     try:
         picks, stats, fstats = refresh()
         save_boards(picks)

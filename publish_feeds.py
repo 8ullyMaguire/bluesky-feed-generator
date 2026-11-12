@@ -92,6 +92,44 @@ def rpc(host, method, data=None, token=None, timeout=45):
         raise RuntimeError(f"{method} HTTP {e.code}: {e.read().decode()[:300]}")
 
 
+def upload_blob(host, path, token, timeout=60):
+    """Upload an image as a blob and return the record-ready blob object.
+
+    A feed generator's icon is a `blob` on the generator record, so it has to
+    exist in the account's repo first. Blobs are immutable: a changed file means
+    a new upload, which is why the caller compares sizes before doing this.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    mime = {".png": "image/png", ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(
+                os.path.splitext(path)[1].lower(), "image/png")
+    req = urllib.request.Request(
+        f"{host}/xrpc/com.atproto.repo.uploadBlob", data=data,
+        headers={"Content-Type": mime, "User-Agent": "feedgen-publish/1.0",
+                 "Authorization": f"Bearer {token}"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return (json.load(r) or {}).get("blob")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"uploadBlob HTTP {e.code}: {e.read().decode()[:300]}")
+
+
+def icon_for(cfg_dir, rkey):
+    """Local icon for a feed, if the deployment ships one.
+
+    Convention over configuration: `<deployment>/icons/<rkey>.png`. The record
+    can then carry an icon without a per-feed config key, and a deployment that
+    ships no icons behaves exactly as before.
+    """
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        p = os.path.join(cfg_dir, "icons", rkey + ext)
+        if os.path.exists(p):
+            return p
+    return None
+
+
 def existing(token):
     out = {}
     try:
@@ -142,10 +180,30 @@ def main(argv):
             "createdAt": cur_val.get("createdAt")
             or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         }
+        icon = icon_for(os.path.dirname(os.path.abspath(CFG_PATH)), rkey)
+        icon_changed = False
+        if icon:
+            # Blobs are content-addressed and immutable, so a size change is the
+            # cheap signal that the local icon differs from the published one.
+            cur_av = cur_val.get("avatar") or {}
+            if cur_av.get("size") != os.path.getsize(icon):
+                icon_changed = True
+                if dry:
+                    print(f"  DRY avatar {rkey:<12} {os.path.basename(icon)}")
+                else:
+                    try:
+                        blob = upload_blob(PDS, icon, token)
+                        if blob:
+                            want["avatar"] = blob
+                            print(f"  + avatar {rkey:<11} "
+                                  f"{os.path.basename(icon)} ({blob.get('size')} B)")
+                    except RuntimeError as e:
+                        print(f"  ERR avatar {rkey}: {e}")
         if cur_val and not force \
                 and cur_val.get("displayName") == want["displayName"] \
                 and cur_val.get("description") == want["description"] \
-                and cur_val.get("acceptsInteractions") is True:
+                and cur_val.get("acceptsInteractions") is True \
+                and not icon_changed:
             print(f"  = {rkey:<18} unchanged")
             continue
         if dry:

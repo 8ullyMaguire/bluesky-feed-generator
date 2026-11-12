@@ -1041,6 +1041,91 @@ def test_keyword_weights_learner_is_config_gated():
     print("ok   keyword weights: config-gated seed, EMA learning, floors, terms")
 
 
+def test_corpus_seed_is_config_gated():
+    """Corpus seeding: off unless the config opts in, and then it loads only the
+    rows inside the configured window. The block exists because CORPUS is module
+    state — every restart used to rank a thin incremental crawl while the posts
+    table held the same window on disk, and supply-bound boards served a fraction
+    of their depth for hours."""
+    if not hasattr(fg, "seed_corpus_from_db"):
+        print("ok   corpus seed absent in this module (skipped)")
+        return
+    con = fg.db()
+    fresh = "at://did:plc:seedtest/app.bsky.feed.post/fresh"
+    stale = "at://did:plc:seedtest/app.bsky.feed.post/stale"
+    now = datetime.now(timezone.utc)
+    rows = [
+        (fresh, "c", "did:plc:seedtest", "seed.test",
+         now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+         json.dumps({"uri": fresh, "cid": "c", "author": {"did": "did:plc:seedtest"},
+                     "record": {"text": "fresh"}, "likeCount": 1}),
+         time.time(), time.time(), "fresh"),
+        (stale, "c", "did:plc:seedtest", "seed.test",
+         (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+         json.dumps({"uri": stale, "cid": "c", "author": {"did": "did:plc:seedtest"},
+                     "record": {"text": "stale"}, "likeCount": 1}),
+         time.time(), time.time(), "stale"),
+    ]
+    old_cfg = fg.CFG.get("corpus_seed")
+    saved = dict(fg.CORPUS["by_uri"])
+    try:
+        with fg.DB_LOCK:
+            con.executemany(
+                "INSERT OR REPLACE INTO posts(uri, cid, author_did, author_handle, "
+                "indexed_at, record_json, first_seen, last_seen, text) "
+                "VALUES(?,?,?,?,?,?,?,?,?)", rows)
+        fg.CORPUS["by_uri"].clear()
+        # absent block (the default): nothing is loaded
+        fg.CFG.pop("corpus_seed", None)
+        assert fg.seed_corpus_from_db() == 0, "absent corpus_seed must not fill"
+        assert fresh not in fg.CORPUS["by_uri"]
+        # disabled explicitly: still nothing
+        fg.CFG["corpus_seed"] = {"enabled": False, "hours": 6}
+        assert fg.seed_corpus_from_db() == 0
+        # enabled: the window loads, the older post does not
+        fg.CFG["corpus_seed"] = {"enabled": True, "hours": 6, "max_posts": 500}
+        n = fg.seed_corpus_from_db()
+        assert fresh in fg.CORPUS["by_uri"], "enabled seed must load the window"
+        assert stale not in fg.CORPUS["by_uri"], "seed must respect its window"
+        assert n >= 1, n
+        # the seeded entry is a real post view, not a bare uri
+        assert fg.CORPUS["by_uri"][fresh]["record"]["text"] == "fresh"
+    finally:
+        fg.CFG["corpus_seed"] = old_cfg if old_cfg is not None else \
+            fg.CFG.pop("corpus_seed", None)
+        fg.CORPUS["by_uri"] = saved
+        with fg.DB_LOCK:
+            con.execute("DELETE FROM posts WHERE uri IN (?,?)", (fresh, stale))
+    print("ok   corpus seed: config-gated, window-bounded, loads real post views")
+
+
+def test_language_axis_and_author_cap_invariants():
+    """A feed that filters by language is the one place a silently wrong config
+    value cannot fail loudly: `require_lang` compares primary subtags, so a full
+    tag ("es-MX") would match nothing and an untagged post is dropped, while the
+    owner's untagged posts still come through the bypass. Pin the shape here, and
+    keep every feed's per-author cap explicit so the knob never drifts back to an
+    implicit default."""
+    bad_tags = {}
+    for f in fg.CFG["feeds"]:
+        for key in ("require_lang", "exclude_langs"):
+            vals = f.get(key) or []
+            wrong = [v for v in vals
+                     if not isinstance(v, str) or "-" in v or v != v.lower()]
+            if wrong:
+                bad_tags[f["rkey"]] = {key: wrong}
+    assert not bad_tags, f"language lists must be lowercase primary subtags: {bad_tags}"
+    lang_feeds = [f["rkey"] for f in fg.CFG["feeds"]
+                  if f.get("require_lang") or f.get("exclude_langs")]
+    no_hide = [r for r in lang_feeds
+               if not next(f for f in fg.CFG["feeds"] if f["rkey"] == r).get("hide_seen")]
+    assert not no_hide, f"language-filtered feeds must hide seen posts: {no_hide}"
+    missing_cap = [f["rkey"] for f in fg.CFG["feeds"] if not f.get("max_per_author")]
+    assert not missing_cap, f"feeds without an explicit max_per_author: {missing_cap}"
+    print(f"ok   language axis + author cap: {len(lang_feeds)} language feeds, "
+          f"all {len(fg.CFG['feeds'])} feeds declare max_per_author")
+
+
 if __name__ == "__main__":
     test_rank_score_velocity_decays_with_age()
     test_rank_score_taste_multiplier_on_any_mode()
@@ -1079,5 +1164,7 @@ if __name__ == "__main__":
     test_extract_terms_and_negative_penalty()
     test_less_event_hides_post_and_sinks_author()
     test_every_feed_hides_seen_posts()
+    test_corpus_seed_is_config_gated()
+    test_language_axis_and_author_cap_invariants()
     test_keyword_weights_learner_is_config_gated()
     print("ALL PASS")
