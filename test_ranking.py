@@ -249,6 +249,48 @@ def test_owner_gate_bypass_can_be_disabled():
     print("ok  owner.gate_bypass=false puts owner posts through the gates")
 
 
+def test_adaptive_gate_does_not_rescan_candidates():
+    """The adaptive gate re-derived "how many non-owner posts so far" by summing
+    over `cands` on every post, which made the candidate loop quadratic: 183 M
+    iterations and 32 s on a 20 k-post feed. A running counter is the same number
+    in O(1), and this guard fails if that re-scan ever comes back."""
+    posts = [post(likes=(i % 40), did="did:plc:a%d" % (i % 60), key="p%d" % i,
+                  langs=["es"]) for i in range(8000)]
+    fcfg = {"rkey": "t", "max_posts": 300, "max_per_author": 20,
+            "min_age_hours": 0, "max_age_hours": 24, "min_likes": 0,
+            "adaptive_target": 120, "require_lang": ["es"]}
+    ob = {"did": "did:plc:own", "always_include": True, "boost": 1.3,
+          "bonus": 0.0, "max_ratio": 0.5}
+    t0 = time.monotonic()
+    scored, st = fg.select(posts, fcfg, NOW, ob, CTX, set())
+    took = time.monotonic() - t0
+    assert len(scored) > 0, "the board must still fill"
+    assert took < 2.0, ("select() is quadratic again: %.1fs for %d posts"
+                        % (took, len(posts)))
+    print("ok  adaptivity is O(1) per post (%.2fs for %d posts)" % (took, len(posts)))
+
+
+def test_owner_picks_respect_max_per_author():
+    """The owner interleave was the one path onto a board that could exceed
+    max_per_author: on a 323-post Spanish board the operator held 24 slots at a
+    cap of 20 — the largest single author on his own "popular" feed."""
+    owner = "did:plc:bigowner"
+    posts = [post(likes=50, did=owner, key="own%d" % i, langs=["es"])
+             for i in range(30)] + [
+        post(likes=5, did="did:plc:o%d" % i, key="o%d" % i, langs=["es"])
+        for i in range(40)]
+    fcfg = {"rkey": "t", "max_posts": 100, "max_per_author": 5,
+            "min_age_hours": 0, "max_age_hours": 24, "min_likes": 0,
+            "adaptive_target": 0, "require_lang": ["es"]}
+    ob = {"did": owner, "always_include": True, "boost": 1.3, "bonus": 0.0,
+          "max_ratio": 0.5}
+    scored, st = fg.select(posts, fcfg, NOW, ob, CTX, set())
+    owner_slots = sum(1 for u, _s in scored if u.startswith("at://" + owner))
+    assert owner_slots <= 5, (owner_slots, len(scored))
+    assert len(scored) > 40, "the board must still fill from other authors"
+    print("ok  owner insertions are capped by max_per_author (%d slots)" % owner_slots)
+
+
 def test_owner_lang_gate_filters_only_the_language_axis():
     """`owner.lang_gate: true` holds the owner to the feed's language axis while
     every other bypass stays on — the narrow fix for a Spanish board carrying the
@@ -318,6 +360,48 @@ def test_owner_lang_gate_sniff_keeps_untagged_spanish():
     assert "own-en" not in keys and "own-tag-en" not in keys, sorted(keys)
     assert st_sniff["owner_lang"] == 2, st_sniff
     print("ok  owner.lang_gate='sniff' keeps untagged Spanish, drops untagged English")
+
+
+def test_config_reload_picks_up_a_changed_file():
+    """A tuning change must not need a restart: a restart empties CORPUS and
+    cold-starts every board. The mtime check reloads in place, and a half-written
+    file keeps the config already in memory instead of taking the service down."""
+    tmpdir = tempfile.mkdtemp(prefix="fgcfg-")
+    path = os.path.join(tmpdir, "config.json")
+    saved = (fg.CONFIG_PATH, fg.CFG, fg.CFG_STAMP, fg.RELOAD_REQUESTED)
+
+    def write(feeds, bad=False):
+        body = {"hostname": "h.test", "publisher_did": "did:plc:p",
+                "feeds": feeds}
+        text = "{not json" if bad else json.dumps(body)
+        with open(path, "w") as fh:
+            fh.write(text)
+        # bump mtime explicitly: two writes inside one filesystem tick would
+        # otherwise look like no change at all
+        os.utime(path, (time.time() + len(feeds), time.time() + len(feeds)))
+
+    try:
+        fg.CONFIG_PATH = path
+        write([{"rkey": "one"}])
+        fg.CFG_STAMP = None
+        assert fg.reload_config_if_changed() is True
+        assert [f["rkey"] for f in fg.CFG["feeds"]] == ["one"]
+        assert fg.reload_config_if_changed() is False, "unchanged file must not reload"
+
+        write([{"rkey": "one"}, {"rkey": "two"}])
+        assert fg.reload_config_if_changed() is True
+        assert [f["rkey"] for f in fg.CFG["feeds"]] == ["one", "two"]
+        assert fg.FEEDS_BY_RKEY["two"]["rkey"] == "two"
+
+        write([{"rkey": "three"}], bad=True)
+        assert fg.reload_config_if_changed() is False
+        assert [f["rkey"] for f in fg.CFG["feeds"]] == ["one", "two"], \
+            "a broken file must keep the running config"
+    finally:
+        (fg.CONFIG_PATH, fg.CFG, fg.CFG_STAMP, fg.RELOAD_REQUESTED) = saved
+        os.remove(path)
+        os.rmdir(tmpdir)
+    print("ok  config reload: change picked up, broken file refused, no restart")
 
 
 def test_cold_start_can_seed_from_follows():
@@ -1210,8 +1294,11 @@ if __name__ == "__main__":
     test_hide_seen_scope_can_be_per_feed()
     test_topic_post_floor_is_continuous()
     test_owner_gate_bypass_can_be_disabled()
+    test_adaptive_gate_does_not_rescan_candidates()
+    test_owner_picks_respect_max_per_author()
     test_owner_lang_gate_filters_only_the_language_axis()
     test_owner_lang_gate_sniff_keeps_untagged_spanish()
+    test_config_reload_picks_up_a_changed_file()
     test_cold_start_can_seed_from_follows()
     test_relevance_telemetry_is_persisted()
     test_feed_owner_override_is_per_feed_and_off_by_default()

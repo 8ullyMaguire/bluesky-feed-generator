@@ -57,6 +57,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sqlite3
 import threading
 import time
@@ -209,7 +210,8 @@ def load_dotenv(path):
     return vals
 
 
-CFG = load_json(os.environ.get("FEEDGEN_CONFIG") or "config.json")
+CONFIG_PATH = os.environ.get("FEEDGEN_CONFIG") or "config.json"
+CFG = load_json(CONFIG_PATH)
 ENV = load_dotenv(".env") | dict(os.environ)
 
 HOSTNAME = CFG["hostname"]
@@ -222,6 +224,58 @@ FEEDS = {
 # The same feeds by bare rkey, for the public pages. One map, built once at
 # import from the same list FEEDS is built from, so the two can never disagree.
 FEEDS_BY_RKEY = {f["rkey"]: f for f in CFG["feeds"]}
+
+
+def config_stamp():
+    try:
+        st = os.stat(os.path.join(BASE, CONFIG_PATH))
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+CFG_STAMP = config_stamp()
+RELOAD_REQUESTED = False
+
+
+def _on_sighup(_signum, _frame):
+    """`systemctl --user reload feedgen`: take the new config at the next cycle
+    rather than restarting and throwing CORPUS away."""
+    global RELOAD_REQUESTED
+    RELOAD_REQUESTED = True
+
+
+def reload_config_if_changed():
+    """Reload the config when the file changes under us.
+
+    The config used to be frozen at import, so every tuning change meant a
+    restart — and a restart empties CORPUS and cold-starts every board, which is
+    how one evening's tuning became three restarts and a cold-start detector.
+    Reloading per cycle makes a tuning change free. `hostname` and
+    `publisher_did` still need a restart: they are baked into FEEDS/SERVICE_DID.
+
+    A half-written file must not take the service down: a parse error keeps the
+    config already in memory and says so.
+    """
+    global CFG, CFG_STAMP, FEEDS_BY_RKEY, RELOAD_REQUESTED
+    stamp = config_stamp()
+    if not RELOAD_REQUESTED and stamp is not None and stamp == CFG_STAMP:
+        return False
+    try:
+        new = load_json(CONFIG_PATH)
+        feeds = [f["rkey"] for f in new["feeds"]]
+    except (ValueError, KeyError, SystemExit) as e:
+        print(f"[{SVC_TAG}] config reload failed, keeping the running config: {e}",
+              flush=True)
+        RELOAD_REQUESTED = False
+        CFG_STAMP = stamp
+        return False
+    CFG = new
+    FEEDS_BY_RKEY = {f["rkey"]: f for f in new["feeds"]}
+    CFG_STAMP = stamp
+    RELOAD_REQUESTED = False
+    print(f"[{SVC_TAG}] config reloaded: {len(feeds)} feeds", flush=True)
+    return True
 
 DB_PATH = os.environ.get("FEEDGEN_DB") or os.path.join(
     os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
@@ -885,6 +939,7 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
     track = {}
     now_ts = now.timestamp()
     cands = []
+    non_owner_n = 0          # maintained below; see the adaptive-gate comment
 
     for p in posts:
         ts = p.get("indexedAt") or (p.get("record") or {}).get("createdAt")
@@ -987,7 +1042,12 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
             target = fcfg.get("adaptive_target", int(fcfg.get("max_posts", 100) * 0.75))
             max_likes_gate = fcfg.get("min_likes", 0) or 0
             max_share_gate = fcfg.get("min_reposts_share", 0) or 0
-            non_owner_so_far = sum(1 for _, _, d in cands if d != owner_did)
+            # Running count, not `sum(1 for ... in cands)`: `cands` grows with
+            # every post, so re-scanning it here made the candidate loop
+            # quadratic — 183 M iterations and 32 s on a 20 k-post feed
+            # (leftist-small), which was the single most expensive thing in a
+            # refresh cycle.
+            non_owner_so_far = non_owner_n
             
             # Calculate adaptive thresholds based on how many we've collected
             if non_owner_so_far < target * 0.5:
@@ -1067,6 +1127,8 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
             if not uri:
                 continue
 
+        if did != owner_did:
+            non_owner_n += 1
         cands.append((s, uri, did))
 
     # Deterministic order: score desc, then URI. Same inputs -> same board,
@@ -1095,6 +1157,12 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
     if 0 < max_ratio < 1 and owner_cands_list:
         interval = max(1, int(1 / max_ratio))
         max_owner = int(len(out) * max_ratio)
+        # The per-author cap is a cap on authors, and the operator is an author:
+        # without this the owner interleave was the one path into the board that
+        # could exceed max_per_author, and on a 323-post Spanish board it did —
+        # the operator was the largest single author on his own "popular" feed.
+        if cap:
+            max_owner = min(max_owner, cap)
         oi = 0
         result = []
         for i, (u, s) in enumerate(out):
@@ -3284,6 +3352,9 @@ def run_maintenance():
 
 def refresh():
     _t_start = time.monotonic()
+    # Cheap enough to check every cycle, and it means a config change lands
+    # within one refresh interval instead of a restart.
+    reload_config_if_changed()
     # Adaptive keyword weights age continuously: decay them (at most once
     # an hour) so a term the community stopped using fades out.
     if kw_enabled():
@@ -3409,8 +3480,16 @@ def refresh():
                 "SELECT uri FROM seen WHERE rkey=? AND shown_at > ?",
                 (f["rkey"], now_ts - ttl * 3600)).fetchall()
             suppressed = {r[0] for r in rows}
+        _t_feed = time.monotonic()
         scored, st = select(posts, f, now, feed_owner(owner, f), ctx,
                             suppressed)
+        # Per-feed cost, so "the ranker scans the corpus once per feed" can be
+        # confirmed or dismissed with a number instead of an intuition. Only the
+        # expensive feeds print; a quiet cycle stays one line.
+        feed_ms = 1000.0 * (time.monotonic() - _t_feed)
+        st["rank_ms"] = int(feed_ms)
+        if feed_ms >= 500:
+            fstats.setdefault("slow_feeds", {})[f["rkey"]] = int(feed_ms)
         picks[f["rkey"]] = [u for u, _s in scored]
         feed_scores[f["rkey"]] = {u: s for u, s in scored}
         stats[f["rkey"]] = st | {"suppressed_set": len(suppressed), "ttl": ttl}
@@ -3471,7 +3550,10 @@ def refresh():
           f"taste+gates={_t_rank0 - _t_ingest:.1f}s "
           f"rank={_t_rank - _t_rank0:.1f}s "
           f"maintenance={_t_end - _t_rank:.1f}s "
-          f"total={_t_end - _t_start:.1f}s", flush=True)
+          f"total={_t_end - _t_start:.1f}s"
+          + (" | slow: " + " ".join(f"{k}={v}ms" for k, v in
+                                    (fstats.get("slow_feeds") or {}).items())
+             if fstats.get("slow_feeds") else ""), flush=True)
     return picks, stats, fstats
 
 
@@ -5065,6 +5147,12 @@ def warm_start():
 
 
 def main():
+    # `systemctl --user reload feedgen` is the cheap path for a config change:
+    # the mtime check in refresh() picks it up, SIGHUP only makes it immediate.
+    try:
+        signal.signal(signal.SIGHUP, _on_sighup)
+    except (ValueError, OSError):        # not the main thread
+        pass
     migrate_legacy_state()
     migrate_schema()
     filled = backfill_requester_daily()

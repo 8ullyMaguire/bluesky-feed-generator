@@ -104,6 +104,9 @@ def main(argv=None):
     ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--threshold", type=float, default=0.4)
     ap.add_argument("--json", default="")
+    ap.add_argument("--state", default="",
+                    help="small JSON status file the daily review reads; written "
+                         "on every run, healthy or not")
     args = ap.parse_args(argv)
 
     caps = caps_from_config(args.config)
@@ -159,6 +162,30 @@ def main(argv=None):
         with open(os.path.expanduser(args.json), "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
             f.write("\n")
+
+    if args.state:
+        # One line of truth for the daily review. Journald is where a failing
+        # unit goes to be ignored; a file the operator already opens is not.
+        state = {
+            "checked_at": int(time.time()),
+            "hours": args.hours,
+            "events": len(events),
+            "damaged_boards": damage,
+            "status": "damage" if damage else "ok",
+            "detail": [
+                {"feed": f["feed"], "settled_final": f["settled_final"],
+                 "max_posts": f["max_posts"], "now": f["now"],
+                 "recovered": f["recovered"]}
+                for ev in report["events"] for f in ev["feeds"]
+                if f["max_posts"] and f["now"] < 0.9 * f["max_posts"]
+            ],
+        }
+        path = os.path.expanduser(args.state)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
 
     if not events:
         print("no corpus step change in the last %.0f h" % args.hours)
