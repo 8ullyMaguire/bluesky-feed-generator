@@ -776,6 +776,82 @@ def gini(vals):
     return (2.0 * cum) / (n * total) - (n + 1) / n
 
 
+def declared_langs(p):
+    """The language tags a post declares, primary subtag only ("es-MX" -> "es")."""
+    _r = p.get("record") if isinstance(p.get("record"), dict) else {}
+    _l = _r.get("langs") or []
+    if isinstance(_l, str):
+        _l = [_l]
+    return {str(x).split("-")[0].lower() for x in _l}
+
+
+def lang_blocked(p, fcfg):
+    """True when the feed's language axis rejects this post.
+
+    Language axis: compare primary subtags, so "es-MX" counts as "es". A
+    require list is strict — a post with no declared language is unknown, not
+    Spanish, so it does not pass. An exclude list only drops declarations it
+    can see; it never guesses a missing tag.
+    """
+    need_langs = {str(x).lower() for x in (fcfg.get("require_lang") or [])}
+    skip_langs = {str(x).lower() for x in (fcfg.get("exclude_langs") or [])}
+    if not (need_langs or skip_langs):
+        return False
+    _prim = declared_langs(p)
+    if need_langs and not (_prim & need_langs):
+        return True
+    if skip_langs and (_prim & skip_langs):
+        return True
+    return False
+
+
+ES_WORDS = frozenset("""
+que de la el los las un una unos unas por para con del al se su sus mas pero
+como este esta estos estas entre cuando muy sin sobre tambien hay desde todo
+toda todos todas nos ni contra otros otra otro ese esa eso esto que quien
+quienes donde cual cuales yo tu ustedes ellos ellas nosotros estar estan
+estaba fue ser son era han ha he hemos les le lo aunque porque ya mientras
+""".split())
+
+EN_WORDS = frozenset("""
+the and of to in is are was were be been being that this these those for with
+you it on at by not from but they them their our we us he she his her its as
+or if then than there what when who whom which how why all more most some any
+just very also would could should can will shall may might must about into
+over after before under above between out up down off again once here
+""".split())
+
+
+def looks_spanish(text):
+    """Cheap Spanish detector for posts that declare no language at all.
+
+    The owner's client never sends a `langs` array (3,781 of 3,781 owner posts
+    in one corpus), so a strict require list would drop every owner post rather
+    than just the English ones. This is the fallback: score Spanish function
+    words and accents against English ones, and require Spanish to win.
+    Deliberately crude and only ever applied to the owner's own posts.
+    """
+    low = (text or "").lower()
+    toks = re.findall(r"[^\W\d_]+", low, re.UNICODE)
+    es = sum(1 for t in toks if t in ES_WORDS)
+    en = sum(1 for t in toks if t in EN_WORDS)
+    if any(ch in low for ch in "áéíóúüñ¿¡"):
+        es += 2
+    return es >= 1 and es > en
+
+
+def owner_lang_blocked(p, fcfg, mode):
+    """The owner's language gate. `mode` true/"strict" trusts declared tags only;
+    "sniff" falls back to looks_spanish() for posts that declare nothing."""
+    sniff = str(mode).lower() == "sniff"
+    if declared_langs(p) or not sniff:
+        return lang_blocked(p, fcfg)
+    need = {str(x).lower() for x in (fcfg.get("require_lang") or [])}
+    if "es" in need:
+        return not looks_spanish(post_topic_text(p))
+    return lang_blocked(p, fcfg)
+
+
 def select(posts, fcfg, now, owner, ctx, suppressed):
     """Rank the posts for one feed. Returns (uris, stats).
 
@@ -796,7 +872,7 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
         owner_did = None
     gate_mode = fcfg.get("gate_mode", "all")
     stats = {"in_window": 0, "pass_share": 0, "pass_gates": 0,
-             "suppressed": 0, "final": 0, "owner": 0,
+             "suppressed": 0, "final": 0, "owner": 0, "owner_lang": 0,
              "vintage_cands": 0, "vintage_picked": 0, "over_max_likes": 0,
              "topic_floor": 0, "topic_unjudged": 0}
     ranking_mode = fcfg.get("ranking", "flat")
@@ -835,7 +911,19 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
         # A feed may set owner.gate_bypass: false; the owner then keeps the
         # boost and the cap but has to clear the same floors as everyone else,
         # which is the honest version of "my content is good enough".
-        if not is_owner or not owner.get("gate_bypass", True):
+        #
+        # `owner.lang_gate` is the narrow version of that: the owner keeps every
+        # other bypass (suppression, likes floors, caps) but is held to the
+        # feed's own language axis. A Spanish board that carries the operator's
+        # English replies is a leak, not a feature. `lang_gate: "sniff"` also
+        # checks the text of owner posts that declare no language at all, which
+        # on this deployment is all of them.
+        bypass_owner = owner.get("gate_bypass", True)
+        if (is_owner and bypass_owner and owner.get("lang_gate")
+                and owner_lang_blocked(p, fcfg, owner["lang_gate"])):
+            stats["owner_lang"] = stats.get("owner_lang", 0) + 1
+            continue
+        if not is_owner or not bypass_owner:
             # Author topicality floor: an account whose stored corpus barely
             # mentions the subject is the firehose a topical feed does not
             # want, however many likes one of its posts collected. Applied
@@ -877,22 +965,10 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
             # question from the time-window Top feeds; without them every feed
             # is the same ranker with a different max_age_hours. Owner posts
             # bypass them like every other gate.
-            # Language axis: compare primary subtags, so "es-MX" counts as
-            # "es". A require list is strict — a post with no declared language
-            # is unknown, not Spanish, so it does not pass. An exclude list only
-            # drops declarations it can see; it never guesses a missing tag.
-            need_langs = {str(x).lower() for x in (fcfg.get("require_lang") or [])}
-            skip_langs = {str(x).lower() for x in (fcfg.get("exclude_langs") or [])}
-            if need_langs or skip_langs:
-                _r = p.get("record") if isinstance(p.get("record"), dict) else {}
-                _l = _r.get("langs") or []
-                if isinstance(_l, str):
-                    _l = [_l]
-                _prim = {str(x).split("-")[0].lower() for x in _l}
-                if need_langs and not (_prim & need_langs):
-                    continue
-                if skip_langs and (_prim & skip_langs):
-                    continue
+            # Language axis: a require list is strict (no declared language is
+            # unknown, not Spanish), an exclude list only drops what it sees.
+            if lang_blocked(p, fcfg):
+                continue
 
             need_media = fcfg.get("require_media") or []
             if need_media:

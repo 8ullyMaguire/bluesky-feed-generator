@@ -41,9 +41,12 @@ CTX = {"topic_affinity": {}, "topic_seeds": set(), "taste": {}, "topic_keywords"
        "author_priors": {}}
 
 
-def post(likes=10, did="did:plc:a", key="p", text="", hours=2.0):
+def post(likes=10, did="did:plc:a", key="p", text="", hours=2.0, langs=None):
+    rec = {"text": text}
+    if langs is not None:
+        rec["langs"] = langs
     return {"uri": f"at://{did}/app.bsky.feed.post/{key}", "cid": "c",
-            "author": {"did": did}, "record": {"text": text},
+            "author": {"did": did}, "record": rec,
             "likeCount": likes, "repostCount": 0, "quoteCount": 0,
             "replyCount": 0,
             "indexedAt": (NOW - timedelta(hours=hours)).isoformat()}
@@ -244,6 +247,77 @@ def test_owner_gate_bypass_can_be_disabled():
     assert any("o1" in u for u, _s in scored2), [u for u, _s in scored2]
     assert len(scored2) == 4, [u for u, _s in scored2]
     print("ok  owner.gate_bypass=false puts owner posts through the gates")
+
+
+def test_owner_lang_gate_filters_only_the_language_axis():
+    """`owner.lang_gate: true` holds the owner to the feed's language axis while
+    every other bypass stays on — the narrow fix for a Spanish board carrying the
+    operator's English replies. Without the key the bypass is untouched."""
+    owner = "did:plc:esowner"
+    posts = [post(likes=0, did=owner, key="own-es", langs=["es"]),
+             post(likes=0, did=owner, key="own-en", langs=["en"]),
+             # no declared language: unknown, not Spanish, so it fails a require
+             # list exactly like the English one
+             post(likes=0, did=owner, key="own-none")] + [
+        post(likes=6, did="did:plc:other%d" % i, key="o%d" % i, langs=["es"])
+        for i in range(10)]
+    fcfg = {"rkey": "t", "max_posts": 50, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24, "min_likes": 5,
+            "adaptive_target": 0, "require_lang": ["es"]}
+    # 0 < max_ratio < 1 is what switches the owner interleave on, and it caps
+    # owner picks at max_ratio x non-owner posts: 10 others -> all 3 eligible.
+    owner_block = {"did": owner, "always_include": True, "boost": 1.3,
+                   "bonus": 0.0, "max_ratio": 0.5}
+
+    # default: the owner bypasses the axis, so all three owner posts are eligible
+    scored, _st = fg.select(posts, fcfg, NOW, owner_block, CTX, set())
+    keys = {u.rsplit("/", 1)[-1] for u, _s in scored}
+    assert {"own-es", "own-en", "own-none"} <= keys, sorted(keys)
+
+    # narrow gate: language only — the ES owner post survives at 0 likes, which
+    # proves the likes floor is still bypassed rather than the whole block applied
+    scored2, st2 = fg.select(posts, fcfg, NOW,
+                             dict(owner_block, lang_gate=True), CTX, set())
+    keys2 = {u.rsplit("/", 1)[-1] for u, _s in scored2}
+    assert "own-es" in keys2, sorted(keys2)
+    assert "own-en" not in keys2 and "own-none" not in keys2, sorted(keys2)
+    assert st2["owner_lang"] == 2, st2
+    assert len([k for k in keys2 if k.startswith("o") and k != "own-es"]) == 10, sorted(keys2)
+    print("ok  owner.lang_gate drops owner posts outside the feed's language")
+
+
+def test_owner_lang_gate_sniff_keeps_untagged_spanish():
+    """The owner's client sends no `langs` array, so a strict gate drops every
+    owner post. `lang_gate: "sniff"` reads the text of untagged ones instead, and
+    declared tags still win over the sniff."""
+    owner = "did:plc:esowner"
+    posts = [
+        post(likes=0, did=owner, key="own-es",
+             text="Buenos días, aquí va el hilo de la semana sobre lo que pasó"),
+        post(likes=0, did=owner, key="own-en",
+             text="Here is the thread about what happened this week, with the numbers"),
+        # declared English: the sniffer never runs, the tag decides
+        post(likes=0, did=owner, key="own-tag-en", text="de la que el los las",
+             langs=["en"]),
+    ] + [post(likes=6, did="did:plc:other%d" % i, key="o%d" % i, langs=["es"])
+         for i in range(10)]
+    fcfg = {"rkey": "t", "max_posts": 50, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24, "min_likes": 5,
+            "adaptive_target": 0, "require_lang": ["es"]}
+    ob = {"did": owner, "always_include": True, "boost": 1.3, "bonus": 0.0,
+          "max_ratio": 0.5}
+
+    strict, st_strict = fg.select(posts, fcfg, NOW, dict(ob, lang_gate=True), CTX, set())
+    strict_keys = {u.rsplit("/", 1)[-1] for u, _s in strict}
+    assert not (strict_keys & {"own-es", "own-en", "own-tag-en"}), sorted(strict_keys)
+    assert st_strict["owner_lang"] == 3, st_strict
+
+    sniffed, st_sniff = fg.select(posts, fcfg, NOW, dict(ob, lang_gate="sniff"), CTX, set())
+    keys = {u.rsplit("/", 1)[-1] for u, _s in sniffed}
+    assert "own-es" in keys, sorted(keys)
+    assert "own-en" not in keys and "own-tag-en" not in keys, sorted(keys)
+    assert st_sniff["owner_lang"] == 2, st_sniff
+    print("ok  owner.lang_gate='sniff' keeps untagged Spanish, drops untagged English")
 
 
 def test_cold_start_can_seed_from_follows():
@@ -1136,6 +1210,8 @@ if __name__ == "__main__":
     test_hide_seen_scope_can_be_per_feed()
     test_topic_post_floor_is_continuous()
     test_owner_gate_bypass_can_be_disabled()
+    test_owner_lang_gate_filters_only_the_language_axis()
+    test_owner_lang_gate_sniff_keeps_untagged_spanish()
     test_cold_start_can_seed_from_follows()
     test_relevance_telemetry_is_persisted()
     test_feed_owner_override_is_per_feed_and_off_by_default()
