@@ -3816,6 +3816,7 @@ def _page(title, body, note=""):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{e(title)}</title>
+<meta name="description" content="{e(title)} — BNWO feeds, public Bluesky feeds that rank and order posts for adults.">
 <style>{PAGE_CSS2}</style>
 </head>
 <body>
@@ -4259,6 +4260,7 @@ def render_age_gate(next_path="/"):
 <html lang="es">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Antes de continuar</title>
+<meta name="description" content="BNWO feeds reúne y ordena publicaciones para adultos de Bluesky. Este sitio contiene material para adultos.">
 <style>
  body{{margin:0;background:#0d0d10;color:#ececf1;font:16px/1.5 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}}
  main{{max-width:34rem;padding:2rem}}
@@ -4331,6 +4333,7 @@ def render_index_page(cfg):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{e(page["title"])}</title>
+<meta name="description" content="{e(page["tagline"])}">
 <style>{PAGE_CSS}</style>
 </head>
 <body>
@@ -4598,7 +4601,20 @@ def render_status_page(snap, cfg):
             for rk, h in sorted((snap.get("hide_stats") or {}).items()))
         + "</p>"
     )
-    return out.encode()
+    # A bare fragment is not a page: no <html>, no <head>, no title, no lang. A browser crawl of the
+    # live site reported exactly that on 2026-11-13 (`/status` — empty document title, axe
+    # document-title, html-has-lang). The tables below are unchanged; only the document around them
+    # is new, so the diagnosis surface the vault reads keeps its shape.
+    return (
+        "<!doctype html>\n"
+        '<html lang="en">\n'
+        '<head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        "<title>BNWO feeds — operator status</title>"
+        '<meta name="description" content="Per-feed counts, gate counters and the last refresh '
+        'for the BNWO Bluesky feeds.">'
+        "</head>\n<body>\n" + out + "\n</body>\n</html>\n"
+    ).encode()
 
 
 # --------------------------------------------------------------------------
