@@ -249,6 +249,79 @@ def test_owner_gate_bypass_can_be_disabled():
     print("ok  owner.gate_bypass=false puts owner posts through the gates")
 
 
+def test_corpus_cap_comes_from_config():
+    """The cap trims by recency, so it decides how many hours a long board can
+    see. It must be settable from config, and must fall back when unset."""
+    saved = fg.CFG.get("corpus")
+    try:
+        fg.CFG.pop("corpus", None)
+        assert fg.corpus_cap() == fg.CORPUS_MAX
+        fg.CFG["corpus"] = {"cap": 70000}
+        assert fg.corpus_cap() == 70000
+        fg.CFG["corpus"] = {"cap": "not-a-number"}
+        assert fg.corpus_cap() == fg.CORPUS_MAX, "a bad value must not crash the cycle"
+    finally:
+        if saved is None:
+            fg.CFG.pop("corpus", None)
+        else:
+            fg.CFG["corpus"] = saved
+    print("ok  corpus cap is config-driven with a safe fallback")
+
+
+def test_source_can_be_scoped_to_named_feeds():
+    """A broad source (the Spanish top search) must reach only the feeds that
+    asked for it, or the widest source in the estate becomes everybody's."""
+    posts = [
+        post(likes=50, did="did:plc:es", key="es-only", langs=["es"]),
+        post(likes=50, did="did:plc:any", key="for-all", langs=["es"]),
+    ]
+    posts[0]["_src_feeds"] = ["feed-es"]
+    fcfg = {"rkey": "feed-es", "max_posts": 50, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24, "min_likes": 0,
+            "adaptive_target": 0, "require_lang": ["es"]}
+    other = dict(fcfg, rkey="feed-other")
+    ob = {"did": "did:plc:own", "always_include": False}
+
+    es_keys = {u.rsplit("/", 1)[-1] for u, _s in fg.select(posts, fcfg, NOW, ob, CTX, set())[0]}
+    other_keys = {u.rsplit("/", 1)[-1] for u, _s in fg.select(posts, other, NOW, ob, CTX, set())[0]}
+    assert "es-only" in es_keys and "for-all" in es_keys, sorted(es_keys)
+    assert "es-only" not in other_keys, sorted(other_keys)
+    assert "for-all" in other_keys, sorted(other_keys)
+    print("ok  _src_feeds scopes a source to the feeds that asked for it")
+
+
+def test_search_blocks_normalise_both_shapes():
+    """`search_sources` (list) wins; the older single `search_source` object keeps
+    working; a disabled block never runs."""
+    saved = fg.CFG.get("search_source"), fg.CFG.get("search_sources")
+    try:
+        fg.CFG.pop("search_sources", None)
+        fg.CFG["search_source"] = {"enabled": True, "terms": ["a"]}
+        blocks = fg.search_source_blocks()
+        assert len(blocks) == 1 and blocks[0]["_key"] == "search", blocks
+
+        fg.CFG["search_sources"] = [
+            {"name": "es-top", "enabled": True, "terms": ["b"], "feeds": ["x"]},
+            {"name": "off", "enabled": False, "terms": ["c"]},
+        ]
+        blocks = fg.search_source_blocks()
+        assert [b["_key"] for b in blocks] == ["es-top"], blocks
+        assert blocks[0]["feeds"] == ["x"]
+
+        fg.CFG["search_source"] = {"enabled": False}
+        fg.CFG.pop("search_sources", None)
+        assert fg.search_source_blocks() == [], "a disabled single source must not run"
+    finally:
+        fg.CFG.pop("search_sources", None)
+        if saved[0] is None:
+            fg.CFG.pop("search_source", None)
+        else:
+            fg.CFG["search_source"] = saved[0]
+        if saved[1] is not None:
+            fg.CFG["search_sources"] = saved[1]
+    print("ok  search sources: list form, single form, disabled block")
+
+
 def test_adaptive_gate_does_not_rescan_candidates():
     """The adaptive gate re-derived "how many non-owner posts so far" by summing
     over `cands` on every post, which made the candidate loop quadratic: 183 M
@@ -1294,6 +1367,9 @@ if __name__ == "__main__":
     test_hide_seen_scope_can_be_per_feed()
     test_topic_post_floor_is_continuous()
     test_owner_gate_bypass_can_be_disabled()
+    test_corpus_cap_comes_from_config()
+    test_source_can_be_scoped_to_named_feeds()
+    test_search_blocks_normalise_both_shapes()
     test_adaptive_gate_does_not_rescan_candidates()
     test_owner_picks_respect_max_per_author()
     test_owner_lang_gate_filters_only_the_language_axis()

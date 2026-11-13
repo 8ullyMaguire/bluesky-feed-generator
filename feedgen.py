@@ -114,7 +114,22 @@ FEED_RANKED_AT = {}  # rkey -> last time its board was ranked
 # merged forward instead of rebuilt. Bounded by CORPUS_MAX and by the longest
 # feed window, which is what a full crawl would have produced anyway.
 CORPUS = {"by_uri": {}}
-CORPUS_MAX = 40000
+CORPUS_MAX = 40000      # default; config `corpus.cap` overrides it at runtime
+
+
+def corpus_cap():
+    """The rolling corpus cap, from config when it says something.
+
+    The cap trims by recency, so it silently decides how many hours of supply a
+    long-window board can see: a source that floods the corpus with recent posts
+    (a broad "top" search is exactly that) shrinks the 3-day board's window even
+    though nothing in its own config changed. Keeping the number in config makes
+    that trade visible instead of buried in a constant.
+    """
+    try:
+        return int((CFG.get("corpus") or {}).get("cap") or CORPUS_MAX)
+    except (TypeError, ValueError):
+        return CORPUS_MAX
 
 
 def merge_corpus(posts, max_age_hours):
@@ -133,9 +148,10 @@ def merge_corpus(posts, max_age_hours):
                 del d[uri]
         except (ValueError, TypeError):
             continue
-    if len(d) > CORPUS_MAX:
+    cap = corpus_cap()
+    if len(d) > cap:
         newest = sorted(d.items(), key=lambda kv: (
-            kv[1].get("indexedAt") or ""), reverse=True)[:CORPUS_MAX]
+            kv[1].get("indexedAt") or ""), reverse=True)[:cap]
         CORPUS["by_uri"] = dict(newest)
         d = CORPUS["by_uri"]
     return list(d.values())
@@ -958,6 +974,12 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
         did = (p.get("author") or {}).get("did")
         if did in CFG.get("blocked_dids", []):
             continue
+        # A source that named its feeds (a broad Spanish search, a topic search)
+        # is a candidate only for those feeds. Without this the widest source in
+        # the estate silently becomes everybody's source.
+        only = p.get("_src_feeds")
+        if only and rkey not in only:
+            continue
         is_owner = bool(owner.get("always_include") and owner_did and did == owner_did)
         likes = p.get("likeCount", 0)
         reposts = p.get("repostCount", 0)
@@ -1609,66 +1631,114 @@ def fetch_ext_feeds():
     return out, stats
 
 
+def search_source_blocks():
+    """The search blocks to run.
+
+    `search_sources` (a list) wins when present; the older single `search_source`
+    object keeps working, so a deployment that has not been rewritten behaves
+    exactly as before. Each block may carry:
+
+      name        identifier for the per-source interval (default: the index)
+      feeds       restrict these posts to these rkeys (absent = every feed)
+      lang        language filter passed to app.bsky.feed.searchPosts
+      sort        "latest" (default) or "top" — "top" is what turns a search from
+                  a firehose of zero-like posts into the popular posts of a
+                  language, which is the difference between a "popular" board
+                  being popular and being merely recent
+    """
+    listed = CFG.get("search_sources")
+    if isinstance(listed, list) and listed:
+        blocks = [b for b in listed if isinstance(b, dict)]
+    else:
+        one = CFG.get("search_source") or {}
+        blocks = [one] if one else []
+    out = []
+    for i, b in enumerate(blocks):
+        if not b.get("enabled"):
+            continue
+        b = dict(b)
+        b["_key"] = str(b.get("name") or ("search" if i == 0 else "search%d" % i))
+        out.append(b)
+    return out
+
+
 def fetch_search_posts(token=None):
     """Authenticated full-text search as a discovery source.
 
-    `app.bsky.feed.searchPosts` answers 403 on public.api.bsky.app; the
-    account's own PDS serves it when the request carries a session token, so
-    this path authenticates exactly like refresh() does. Results are tagged
-    `_search_src=<term>` and scored with the source multiplier.
+    `app.bsky.feed.searchPosts` answers 403 on public.api.bsky.app; the account's
+    own PDS serves it when the request carries a session token, so this path
+    authenticates exactly like refresh() does. Results are tagged
+    `_search_src=<term>`, scored with the block's source multiplier, and — when
+    the block names `feeds` — tagged `_src_feeds` so select() offers them only to
+    those feeds.
+
+    Several blocks run independently (`search_sources`), each with its own
+    interval, language and sort. That is what lets one deployment keep a narrow
+    ideology search for every feed and add a broad "most popular in Spanish"
+    search for two of them, without the second widening the first.
     """
-    sc = CFG.get("search_source") or {}
-    if not sc.get("enabled"):
+    blocks = search_source_blocks()
+    if not blocks:
         return [], {}
-    terms = [t for t in (sc.get("terms") or []) if str(t).strip()]
-    if not terms:
-        return [], {}
-    if not _src_due("search", sc.get("interval_secs", 600)):
-        return [], {"skipped": True}
-    host = (sc.get("host")
-            or (CFG.get("source") or {}).get("pds_host")
-            or "https://bsky.social")
-    pages = max(1, min(5, int(sc.get("pages", 1))))
-    limit = max(1, min(100, int(sc.get("limit", 100))))
-    max_age_h = float(sc.get("max_age_hours", 72))
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_h)).isoformat()
-    mult = float(sc.get("score_mult", 1.0))
-    add = float(sc.get("boost", 0.0) or 0.0)
     out, hit = [], {}
-    for term in terms:
-        cursor = None
-        n = 0
-        for _ in range(pages):
-            q = {"q": term, "limit": limit, "sort": sc.get("sort", "latest")}
-            if cursor:
-                q["cursor"] = cursor
-            try:
-                d = rpc(host, "app.bsky.feed.searchPosts?"
-                        + urllib.parse.urlencode(q), token=token, timeout=45)
-            except Exception as ex:                   # noqa: BLE001
-                print(f"[{SVC_TAG}] search '{term}' failed: {ex}", flush=True)
-                break
-            items = d.get("posts") or []
-            if not items:
-                break
-            for p in items:
-                ts = p.get("indexedAt") or (p.get("record") or {}).get("createdAt")
-                if not ts or ts < cutoff:
-                    continue
-                p["_search_src"] = term
-                p["_src_mult"] = mult
-                p["_src_boost"] = add
-                out.append(p)
-                n += 1
-            cursor = d.get("cursor")
-            if not cursor:
-                break
+    for b in blocks:
+        key = b["_key"]
+        terms = [t for t in (b.get("terms") or []) if str(t).strip()]
+        if not terms:
+            continue
+        if not _src_due(key, b.get("interval_secs", 600)):
+            continue
+        host = (b.get("host")
+                or (CFG.get("source") or {}).get("pds_host")
+                or "https://bsky.social")
+        pages = max(1, min(5, int(b.get("pages", 1))))
+        limit = max(1, min(100, int(b.get("limit", 100))))
+        max_age_h = float(b.get("max_age_hours", 72))
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_h)).isoformat()
+        mult = float(b.get("score_mult", 1.0))
+        add = float(b.get("boost", 0.0) or 0.0)
+        lang = b.get("lang")
+        only = [str(x) for x in (b.get("feeds") or [])]
+        got = 0
+        for term in terms:
+            cursor = None
+            n = 0
+            for _ in range(pages):
+                q = {"q": term, "limit": limit, "sort": b.get("sort", "latest")}
+                if lang:
+                    q["lang"] = lang
+                if cursor:
+                    q["cursor"] = cursor
+                try:
+                    d = rpc(host, "app.bsky.feed.searchPosts?"
+                            + urllib.parse.urlencode(q), token=token, timeout=60)
+                except Exception as ex:                   # noqa: BLE001
+                    print(f"[{SVC_TAG}] search '{key}:{term}' failed: {ex}", flush=True)
+                    break
+                items = d.get("posts") or []
+                if not items:
+                    break
+                for p in items:
+                    ts = p.get("indexedAt") or (p.get("record") or {}).get("createdAt")
+                    if not ts or ts < cutoff:
+                        continue
+                    p["_search_src"] = term
+                    p["_src_mult"] = mult
+                    p["_src_boost"] = add
+                    if only:
+                        p["_src_feeds"] = list(only)
+                    out.append(p)
+                    n += 1
+                cursor = d.get("cursor")
+                if not cursor:
+                    break
+                time.sleep(0.2)
+            hit[term] = n
+            got += n
             time.sleep(0.2)
-        hit[term] = n
-        time.sleep(0.2)
-    _src_mark("search")
-    print(f"[{SVC_TAG}] search_source: {sum(hit.values())} posts from "
-          f"{len(hit)} terms", flush=True)
+        _src_mark(key)
+        print(f"[{SVC_TAG}] search_source[{key}]: {got} posts from {len(terms)} terms"
+              + (f" -> {','.join(only)}" if only else ""), flush=True)
     return out, hit
 
 
@@ -3574,7 +3644,8 @@ def refresh_loop():
             print(f"[{SVC_TAG}] refresh ok: total={sum(len(v) for v in picks.values())} "
                   f"{per_feed} | scanned={fstats['list_items']} "
                   f"pages={fstats['pages']} owner={fstats['owner_posts']} "
-                  f"state={fstats['state_uris']}", flush=True)
+                  f"state={fstats['state_uris']} "
+                  f"corpus={len(CORPUS['by_uri'])}/{corpus_cap()}", flush=True)
         except Exception as e:
             with CACHE_LOCK:
                 CACHE["error"] = f"{type(e).__name__}: {e}"[:300]
