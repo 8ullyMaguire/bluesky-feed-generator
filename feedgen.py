@@ -570,6 +570,7 @@ CREATE TABLE IF NOT EXISTS metrics_log (
     score_median REAL, score_p90 REAL,
     kw_hit_rate REAL, no_text_rate REAL, affinity_p50 REAL,
     engagement_gini REAL,
+    engagement_median REAL,
     PRIMARY KEY (ts, feed_rkey))
 """
 
@@ -611,7 +612,7 @@ def migrate_schema():
         # Relevance telemetry: keyword hit rate, share of text-less media,
         # median author topicality and engagement concentration per board.
         for col in ("kw_hit_rate", "no_text_rate", "affinity_p50",
-                    "engagement_gini"):
+                    "engagement_gini", "engagement_median"):
             if col not in ml:
                 db().execute(
                     f"ALTER TABLE metrics_log ADD COLUMN {col} REAL")
@@ -2871,7 +2872,7 @@ def log_metrics(picks_by_feed, feed_scores, now_ts, stats=None):
             uris = list(uris or [])
             if not uris:
                 rows.append((ts, rkey, 0, 0, None, None, None,
-                             None, None, None, None))
+                             None, None, None, None, None))
                 continue
             scores = (feed_scores or {}).get(rkey, {})
             authors, ages, sc = set(), [], []
@@ -2921,7 +2922,8 @@ def log_metrics(picks_by_feed, feed_scores, now_ts, stats=None):
                          round(kw_hit / n_board, 3) if n_board else None,
                          round(no_text / n_board, 3) if n_board else None,
                          round(_med(affs), 3) if affs else None,
-                         round(gini(engs), 3) if engs else None))
+                         round(gini(engs), 3) if engs else None,
+                         round(_med(engs), 1) if engs else None))
         funnel = {}
         for rkey, st in (stats or {}).items():
             prev = db().execute(
@@ -2943,8 +2945,9 @@ def log_metrics(picks_by_feed, feed_scores, now_ts, stats=None):
                 "INSERT OR REPLACE INTO metrics_log(ts, feed_rkey, posts, "
                 "unique_authors, median_age_hours, score_median, score_p90, "
                 "kw_hit_rate, no_text_rate, affinity_p50, engagement_gini, "
+                "engagement_median, "
                 "in_window, post_gate, suppressed, final, served) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [tuple(r) + funnel.get(r[1], (0, 0, 0, 0, 0)) for r in rows])
             db().execute("DELETE FROM metrics_log WHERE ts < ?",
                          (ts - 90 * 86400,))
@@ -4608,17 +4611,19 @@ def render_status_page(snap, cfg):
     mrows = ""
     eng = likes_per_1k(7)
     try:
-        for (rk, n, ua, ma, sm, sp, kw, nt, ap, gi,
+        for (rk, n, ua, ma, sm, sp, kw, nt, ap, gi, em,
              iw, pg, su, fi, se) in db().execute(
                 "SELECT feed_rkey, posts, unique_authors, "
                 "median_age_hours, score_median, score_p90, "
                 "kw_hit_rate, no_text_rate, affinity_p50, engagement_gini, "
+                "engagement_median, "
                 "in_window, post_gate, suppressed, final, served FROM "
                 "metrics_log WHERE ts=(SELECT MAX(ts) FROM metrics_log)"):
             e = eng.get(rk) or {}
             mrows += (f"<tr><td>{rk}</td><td>{n}</td><td>{ua}</td>"
                       f"<td>{ma}</td><td>{sm}</td><td>{sp}</td>"
                       f"<td>{kw}</td><td>{nt}</td><td>{ap}</td><td>{gi}</td>"
+                      f"<td>{em}</td>"
                       f"<td>{iw}</td><td>{pg}</td><td>{su}</td><td>{fi}</td>"
                       f"<td>{se}</td><td>{e.get('likes', 0)}</td>"
                       f"<td>{e.get('per_1k', 0.0)}</td></tr>")
@@ -4628,7 +4633,7 @@ def render_status_page(snap, cfg):
                     f"<tr><th>feed</th><th>posts</th><th>unique authors</th>"
                     f"<th>median age h</th><th>score median</th>"
                     f"<th>score p90</th><th>kw hit</th><th>no text</th>"
-                    f"<th>aff p50</th><th>eng gini</th>"
+                    f"<th>aff p50</th><th>eng gini</th><th>eng med</th>"
                     f"<th>in_window</th><th>post_gate</th>"
                     f"<th>suppressed</th><th>final</th><th>served</th>"
                     f"<th>likes 7d</th><th>likes/1k</th></tr>{mrows}</table>")

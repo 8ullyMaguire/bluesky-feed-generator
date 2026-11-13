@@ -74,6 +74,24 @@ assert row[0] == 120 and row[1] == 80 and row[2] == 11 and row[3] == 2, row
 assert row[4] == 201, row          # serves since the previous row for this feed
 print("funnel persisted ok:", row)
 
+# Engagement median: the weekly report averages this column, so it must be the
+# board's median engagement (likes + 2*reposts + 3*replies), not the mean.
+from datetime import datetime, timezone  # noqa: E402
+now_iso = datetime.now(timezone.utc).isoformat()
+con.executemany(
+    "INSERT OR REPLACE INTO posts(uri, author_did, indexed_at, text, record_json, "
+    "like_count, repost_count, reply_count, first_seen, last_seen) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+    [("at://post/e/1", "did:plc:a", now_iso, "t", "{}", 10, 2, 1, NOW, NOW),
+     ("at://post/e/2", "did:plc:a", now_iso, "t", "{}", 5, 0, 0, NOW, NOW),
+     ("at://post/e/3", "did:plc:a", now_iso, "t", "{}", 8, 0, 0, NOW, NOW)])
+fg.log_metrics({"x": ["at://post/e/1", "at://post/e/2", "at://post/e/3"]}, {},
+               NOW, stats={"x": {}})
+row = con.execute("SELECT engagement_median FROM metrics_log WHERE feed_rkey='x' "
+                  "ORDER BY ts DESC LIMIT 1").fetchone()
+assert row[0] == 8, row            # median of 17, 8, 5
+print("engagement median persisted ok:", row[0])
+
 cols = {r[1] for r in con.execute("PRAGMA table_info(metrics_log)")}
 assert {"in_window", "post_gate", "suppressed", "final", "served"} <= cols
 fg.migrate_schema()
