@@ -92,6 +92,24 @@ row = con.execute("SELECT engagement_median FROM metrics_log WHERE feed_rkey='x'
 assert row[0] == 8, row            # median of 17, 8, 5
 print("engagement median persisted ok:", row[0])
 
+# Board age: the column was NULL for every feed because a datetime was
+# subtracted from an epoch float. Two posts, 2h and 6h old -> median 4h.
+from datetime import timedelta  # noqa: E402
+old_iso = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+new_iso = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+con.executemany(
+    "INSERT OR REPLACE INTO posts(uri, author_did, indexed_at, text, record_json, "
+    "like_count, repost_count, reply_count, first_seen, last_seen) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+    [("at://post/a/1", "did:plc:a", old_iso, "t", "{}", 3, 0, 0, NOW, NOW),
+     ("at://post/a/2", "did:plc:a", new_iso, "t", "{}", 3, 0, 0, NOW, NOW)])
+fg.log_metrics({"x": ["at://post/a/1", "at://post/a/2"]}, {}, time.time(),
+               stats={"x": {}})
+age = con.execute("SELECT median_age_hours FROM metrics_log WHERE feed_rkey='x' "
+                  "ORDER BY ts DESC LIMIT 1").fetchone()[0]
+assert 3.9 < age < 4.1, age
+print("median board age persisted ok:", age)
+
 cols = {r[1] for r in con.execute("PRAGMA table_info(metrics_log)")}
 assert {"in_window", "post_gate", "suppressed", "final", "served"} <= cols
 fg.migrate_schema()

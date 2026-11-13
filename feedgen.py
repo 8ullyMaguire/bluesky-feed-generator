@@ -155,6 +155,21 @@ def merge_corpus(posts, max_age_hours):
         except (ValueError, TypeError):
             continue
     cap = corpus_cap()
+    protected = [kv for kv in d.items() if kv[1].get("_src_protect")]
+    if protected and len(d) > cap:
+        # Posts a window source fetched on purpose (a `since_hours` search) are
+        # older than everything the crawl brings back, so a newest-first trim
+        # evicts exactly them — the corpus stayed at ~31 h while the "week"
+        # search returned 2.5k in-window posts that were then immediately
+        # dropped. Keep them, and let the cap govern the rest.
+        rest = [(kv, kv[1].get("indexedAt") or "") for kv in d.items()
+                if not kv[1].get("_src_protect")]
+        rest.sort(key=lambda t: t[1], reverse=True)
+        room = max(0, cap - len(protected))
+        keep = dict(protected)
+        keep.update(dict(kv for kv, _ts in rest[:room]))
+        CORPUS["by_uri"] = keep
+        d = CORPUS["by_uri"]
     if len(d) > cap:
         newest = sorted(d.items(), key=lambda kv: (
             kv[1].get("indexedAt") or ""), reverse=True)[:cap]
@@ -1794,6 +1809,11 @@ def fetch_search_posts(token=None):
                     p["_src_key"] = key
                     p["_src_mult"] = mult
                     p["_src_boost"] = add
+                    if b.get("since_hours"):
+                        # A window source exists to reach posts the rolling
+                        # corpus cannot hold. Protecting them from the recency
+                        # trim is the difference between "fetched" and "usable".
+                        p["_src_protect"] = True
                     if only:
                         p["_src_feeds"] = list(only)
                     out.append(p)
@@ -2918,8 +2938,13 @@ def log_metrics(picks_by_feed, feed_scores, now_ts, stats=None):
                         f"FROM posts WHERE uri IN ({q})", chunk):
                     authors.add(a)
                     try:
-                        ages.append((now_ts - parse_time(idx)).total_seconds()
-                                    / 3600)
+                        # parse_time() returns a datetime; subtracting it from the
+                        # epoch float raised TypeError for every post, which is
+                        # why median_age_hours sat NULL for every feed since the
+                        # column was added. The board's freshness is not optional
+                        # telemetry: it is how you tell a "week" feed from a
+                        # "last day" one.
+                        ages.append((now_ts - parse_time(idx).timestamp()) / 3600)
                     except Exception:
                         pass
                     s = scores.get(uri)

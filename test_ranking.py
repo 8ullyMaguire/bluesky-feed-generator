@@ -1390,6 +1390,34 @@ def test_keyword_weights_learner_is_config_gated():
     print("ok   keyword weights: config-gated seed, EMA learning, floors, terms")
 
 
+def test_corpus_keeps_window_sourced_posts_past_the_cap():
+    """A `since_hours` search exists to reach posts the rolling corpus cannot
+    hold. The recency trim used to evict exactly those: the week source returned
+    2.5k in-window posts and the corpus stayed at ~31 hours of supply."""
+    old_cap = fg.CFG.get("corpus")
+    try:
+        fg.CFG["corpus"] = {"cap": 5}
+        recent = [post(likes=1, did="did:plc:r", key="r%d" % i, hours=1)
+                  for i in range(10)]
+        window = [post(likes=1, did="did:plc:w", key="w%d" % i, hours=100)
+                  for i in range(2)]
+        for p in window:
+            p["_src_key"] = "wk"
+            p["_src_protect"] = True
+        stale = post(likes=1, did="did:plc:s", key="s0", hours=100)  # not protected
+        fg.merge_corpus(recent + window + [stale], 168)
+        uris = set(fg.CORPUS["by_uri"])
+        kept_w = [u for u in uris if "/w" in u]
+        assert len(kept_w) == 2, (len(kept_w), len(uris))
+        assert not any("/s0" in u for u in uris), "unprotected old post must be trimmed"
+        assert len(uris) <= 5, len(uris)
+        print("ok  window-sourced posts survive the corpus cap (%d kept, cap 5)"
+              % len(uris))
+    finally:
+        fg.CORPUS["by_uri"].clear()
+        fg.CFG["corpus"] = old_cap
+
+
 def test_corpus_seed_is_config_gated():
     """Corpus seeding: off unless the config opts in, and then it loads only the
     rows inside the configured window. The block exists because CORPUS is module
@@ -1526,6 +1554,7 @@ if __name__ == "__main__":
     test_owner_bonus_mode_relative_is_scale_invariant()
     test_owner_bonus_mode_off_leaves_the_board_alone()
     test_chrono_ignores_owner_promotion()
+    test_corpus_keeps_window_sourced_posts_past_the_cap()
     test_corpus_seed_is_config_gated()
     test_language_axis_and_author_cap_invariants()
     test_keyword_weights_learner_is_config_gated()
