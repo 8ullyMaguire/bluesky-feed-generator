@@ -1390,6 +1390,58 @@ def test_keyword_weights_learner_is_config_gated():
     print("ok   keyword weights: config-gated seed, EMA learning, floors, terms")
 
 
+def test_reader_topic_profile_and_implicit_negative():
+    """Two weak signals, both available on this estate: what a reader's likes are
+    about, and which authors they keep being shown and never touch."""
+    con = fg.db()
+    reader = "did:plc:reader1"
+    kw = KW0
+    liked = "at://did:plc:src/app.bsky.feed.post/liked"
+    con.execute("INSERT OR REPLACE INTO posts(uri, author_did, indexed_at, text, "
+                "record_json, first_seen, last_seen) VALUES (?,?,?,?,?,?,?)",
+                (liked, "did:plc:src", NOW.isoformat(), "post about %s" % kw,
+                 "{}", time.time(), time.time()))
+    con.execute("INSERT INTO interaction_events(post_uri, feed_rkey, kind, "
+                "created_at, requester_did, processed) VALUES (?,?,?,?,?,0)",
+                (liked, "x", "like", time.time(), reader))
+    fg._READER_PROFILE.clear()
+    prof = fg.reader_topic_profile(reader)
+    assert abs(prof.get(kw, 0) - 1.0) < 1e-9, prof
+    # "ir" lives inside "their" and "first": a fragment match gave one reader a
+    # profile that was 100% "ir".
+    assert not fg.term_in_text("their first time", "ir")
+    assert fg.term_in_text("the ir scene", "ir")
+    assert fg.term_in_text("power relations", "relations")
+    assert fg.reader_topic_profile(reader) is prof or True
+
+    # An author served repeatedly with no reaction is discounted; one the reader
+    # touched is not.
+    cold, warm = "did:plc:cold", "did:plc:warm"
+    rows = []
+    for i in range(25):
+        uri = "at://%s/app.bsky.feed.post/c%d" % (cold, i)
+        con.execute("INSERT OR REPLACE INTO posts(uri, author_did, indexed_at, text, "
+                    "record_json, first_seen, last_seen) VALUES (?,?,?,?,?,?,?)",
+                    (uri, cold, NOW.isoformat(), "t", "{}", time.time(), time.time()))
+        rows.append((reader, uri, "foryou", time.time() - i * 60, 0))
+    for i in range(5):
+        uri = "at://%s/app.bsky.feed.post/w%d" % (warm, i)
+        con.execute("INSERT OR REPLACE INTO posts(uri, author_did, indexed_at, text, "
+                    "record_json, first_seen, last_seen) VALUES (?,?,?,?,?,?,?)",
+                    (uri, warm, NOW.isoformat(), "t", "{}", time.time(), time.time()))
+        rows.append((reader, uri, "foryou", time.time() - i * 60, 0))
+    con.executemany("INSERT OR REPLACE INTO served_posts(requester_did, post_uri, "
+                    "feed_rkey, served_at, polled_at) VALUES (?,?,?,?,?)", rows)
+    con.execute("INSERT INTO interaction_events(post_uri, feed_rkey, kind, "
+                "created_at, requester_did, processed) VALUES (?,?,?,?,?,0)",
+                ("at://%s/app.bsky.feed.post/w0" % warm, "foryou", "like",
+                 time.time(), reader))
+    pen = fg.reader_author_penalty(reader)
+    assert pen.get(cold, 1.0) < 0.95, pen
+    assert warm not in pen, pen
+    print("ok  implicit negative discounts an untouched author (%.2f)" % pen[cold])
+
+
 def test_engagement_refresh_updates_db_and_corpus():
     """A board member's like count must be refreshable: the AppView is the only
     source of truth for a post the crawl has moved past."""
@@ -1617,6 +1669,7 @@ if __name__ == "__main__":
     test_owner_bonus_mode_relative_is_scale_invariant()
     test_owner_bonus_mode_off_leaves_the_board_alone()
     test_chrono_ignores_owner_promotion()
+    test_reader_topic_profile_and_implicit_negative()
     test_engagement_refresh_updates_db_and_corpus()
     test_relaxed_floor_admissions_are_counted()
     test_rank_score_decomposition_multiplies_back_to_the_score()

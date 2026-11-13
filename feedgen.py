@@ -2891,6 +2891,104 @@ def negative_term_penalty(text, terms, factor=0.25):
     return max(0.5, 1.0 - float(factor) * min(hits, 5))
 
 
+_READER_PROFILE = {}          # requester_did -> (ts, {term: share})
+_WORD_RE = None
+
+
+def term_in_text(text, term):
+    """Does `text` contain `term` as a word (or a phrase), not as a fragment?
+
+    The topic vocabulary has short entries ("ir", "dom", "bbc"), and a plain
+    substring test matched "ir" inside "their" and "first" — one reader's entire
+    profile came out as a single 1.0 for "ir". Word boundaries for single words,
+    substring for phrases.
+    """
+    global _WORD_RE
+    if not text or not term:
+        return False
+    if " " in term:
+        return term in text
+    if _WORD_RE is None:
+        _WORD_RE = re.compile(r"\w+", re.UNICODE)
+    return term in set(_WORD_RE.findall(text))
+_READER_PROFILE_TTL = 3600.0
+
+
+def reader_topic_profile(requester_did, now=None):
+    """What this reader's own likes are about, as keyword shares.
+
+    The estate has 220 readers a month and 32 of them have ever liked anything,
+    so an author-level affinity is a scalar fitted on almost no data. A keyword
+    profile is coarser and needs fewer observations: five likes on housing posts
+    say something even when they come from five different authors.
+    """
+    now = time.time() if now is None else now
+    hit = _READER_PROFILE.get(requester_did)
+    if hit and now - hit[0] < _READER_PROFILE_TTL:
+        return hit[1]
+    kws = [k.lower() for k in (CFG.get("topic_keywords") or [])]
+    prof = {}
+    if kws and requester_did:
+        try:
+            rows = db().execute(
+                "SELECT p.text FROM interaction_events e "
+                "JOIN posts p ON p.uri = e.post_uri "
+                "WHERE e.requester_did=? AND e.kind IN ('like','repost') "
+                "AND p.text IS NOT NULL LIMIT 300", (requester_did,)).fetchall()
+        except sqlite3.Error:
+            rows = []
+        counts = {}
+        for (text,) in rows:
+            low = (text or "").lower()
+            for kw in kws:
+                if term_in_text(low, kw):
+                    counts[kw] = counts.get(kw, 0) + 1
+        total = float(sum(counts.values()) or 0)
+        if total:
+            prof = {k: v / total for k, v in counts.items()}
+    _READER_PROFILE[requester_did] = (now, prof)
+    return prof
+
+
+def reader_author_penalty(requester_did, now=None):
+    """Authors this reader keeps being shown and never touches.
+
+    Most readers here never produce an interaction at all: 220 a month, 32 with a
+    single like. "Served twenty times, never liked, reposted or replied" is weak
+    evidence but it is the only evidence, and it should not count for nothing.
+    """
+    tcfg = CFG.get("tension") or {}
+    if not tcfg.get("implicit_negative", True) or not requester_did:
+        return {}
+    now = time.time() if now is None else now
+    days = float(tcfg.get("implicit_negative_days", 30) or 30)
+    decay = float(tcfg.get("implicit_negative_decay", 0.97) or 0.97)
+    floor = float(tcfg.get("implicit_negative_floor", 0.7) or 0.7)
+    try:
+        rows = db().execute(
+            "SELECT p.author_did, COUNT(*) n, "
+            "  SUM(CASE WHEN e.uri IS NOT NULL THEN 1 ELSE 0 END) touched "
+            "FROM served_posts sp JOIN posts p ON p.uri = sp.post_uri "
+            "LEFT JOIN (SELECT DISTINCT post_uri uri FROM interaction_events "
+            "           WHERE requester_did=? AND kind IN ('like','repost','reply')) e "
+            "  ON e.uri = sp.post_uri "
+            "WHERE sp.requester_did=? AND sp.served_at > ? "
+            "GROUP BY p.author_did", (requester_did, requester_did,
+                                      now - days * 86400)).fetchall()
+    except sqlite3.Error:
+        return {}
+    out = {}
+    min_n = int(tcfg.get("implicit_negative_min", 10) or 10)
+    for did, n, touched in rows:
+        if int(n or 0) < min_n:
+            continue          # too few deliveries to call it evidence
+        dead = int(n or 0) - 3 * int(touched or 0)
+        if dead <= 0:
+            continue
+        out[did] = max(floor, decay ** dead)
+    return out
+
+
 def personalize_page(requester_did, rkey, board, scores):
     """Serve-time per-user personalization for CFG["tension"]["personal_feeds"]
     (the For You feeds).
@@ -2926,10 +3024,25 @@ def personalize_page(requester_did, rkey, board, scores):
                              tcfg.get("negative_term_min_hits", 1))
     nfac = float(tcfg.get("negative_term_factor", 0.25))
 
+    prof = reader_topic_profile(requester_did)
+    topic_w = float(tcfg.get("reader_topic_weight", 0.0) or 0.0)
+    pen_author = reader_author_penalty(requester_did)
+
+    def topic_fit(text):
+        if not (prof and topic_w):
+            return 1.0
+        low = (text or "").lower()
+        if not low:
+            return 1.0
+        share = sum(w for kw, w in prof.items() if term_in_text(low, kw))
+        return 1.0 + topic_w * min(1.0, share * 3.0)
+
     def adj(uri):
         a = max(-0.9, min(2.0, aff.get(auth.get(uri, ""), 0.0)))
+        an = auth.get(uri, "")
         pen = negative_term_penalty(texts.get(uri, ""), neg, nfac)
-        return scores.get(uri, 0.0) * (1.0 + a) * pen
+        return (scores.get(uri, 0.0) * (1.0 + a) * pen
+                * topic_fit(texts.get(uri, "")) * pen_author.get(an, 1.0))
 
     ranked = sorted(board, key=lambda u: (-adj(u), u))
 
