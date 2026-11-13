@@ -1159,9 +1159,10 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
                 stats["suppressed"] += 1
                 continue
         else:
+            # The owner's promotion is applied after every candidate is scored,
+            # because the honest bonus depends on the board it lands on. See the
+            # block below the loop.
             s = rank_score(p, fcfg, w, age_h, ctx)
-            if ranking_mode != "chrono":
-                s = s * owner.get("boost", 1.0) + owner.get("bonus", 0.0)
             stats["owner"] += 1
             stats["pass_share"] += 1
             stats["pass_gates"] += 1
@@ -1172,6 +1173,36 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
         if did != owner_did:
             non_owner_n += 1
         cands.append((s, uri, did))
+
+    # --- owner promotion, scaled to the board it lands on ---------------
+    # A flat bonus is not a nudge: measured on the live boards, a +3.0 sat at or
+    # above the 90th percentile of every velocity board (p90 2.5-3.4), so every
+    # operator post outranked every organic one by arithmetic. The same +3.0 is
+    # invisible on the flat Spanish boards (median 4.2) and meaningless on the
+    # trending board (p90 18.4, vintage rates). `bonus_mode: "relative"` makes
+    # the push a fraction of the median non-owner score, so it is a thumb on the
+    # scale on every board instead of a takeover on some and a rounding error on
+    # others. "absolute" keeps the historical behaviour; "off" removes both the
+    # multiplier and the bonus (the interleave, if any, still applies).
+    if owner_did and owner and ranking_mode != "chrono":
+        mode = str(owner.get("bonus_mode") or "absolute").lower()
+        boost = float(owner.get("boost", 1.0) or 1.0)
+        if mode == "relative":
+            base = sorted(s for s, _u, d in cands if d != owner_did)
+            if base:
+                mid = len(base) // 2
+                med = (base[mid] if len(base) % 2 else
+                       (base[mid - 1] + base[mid]) / 2.0)
+            else:
+                med = 0.0
+            push = float(owner.get("bonus_frac", 0.3) or 0.0) * med
+        elif mode == "off":
+            boost, push = 1.0, 0.0
+        else:
+            push = float(owner.get("bonus", 0.0) or 0.0)
+        if boost != 1.0 or push:
+            cands = [(s * boost + push, u, d) if d == owner_did else (s, u, d)
+                     for s, u, d in cands]
 
     # Deterministic order: score desc, then URI. Same inputs -> same board,
     # so a refresh does not reshuffle a subscriber's feed.

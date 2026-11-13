@@ -226,6 +226,81 @@ def test_topic_post_floor_is_continuous():
     print("ok  topic_post_floor scores the post, not just its author")
 
 
+def test_owner_bonus_mode_relative_is_scale_invariant():
+    """A flat owner bonus is a takeover on a weak board and invisible on a strong
+    one; the relative mode must put the operator a fixed *fraction* above the
+    board's median regardless of what the median is.
+
+    Measured on the live estate: +3.0 sat at or above the 90th percentile of
+    every velocity board (p90 2.5-3.4) and below the median of the flat Spanish
+    boards (4.2), so one constant cannot be right for both.
+    """
+    owner = "did:plc:own"
+    fcfg = {"rkey": "t", "max_posts": 50, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24, "ranking": "flat"}
+    rel = {"did": owner, "always_include": True, "boost": 1.0,
+           "bonus_mode": "relative", "bonus_frac": 0.3, "max_ratio": 0.5}
+    absolute = {"did": owner, "always_include": True, "boost": 1.0,
+                "bonus": 3.0, "max_ratio": 0.5}
+    ratios = {}
+    for likes in (1, 200, 4000):
+        posts = [post(likes=likes, did=owner, key="own")] + [
+            post(likes=likes, did="did:plc:u%d" % i, key="u%d" % i)
+            for i in range(9)]
+        got = {}
+        for label, ob in (("rel", rel), ("abs", absolute)):
+            scored, _ = fg.select(posts, fcfg, NOW, ob, CTX, set())
+            sco = dict(scored)
+            own_uri = "at://%s/app.bsky.feed.post/own" % owner
+            others = sorted(v for k, v in sco.items() if k != own_uri)
+            med = others[len(others) // 2]
+            got[label] = sco[own_uri] / med
+        ratios[likes] = got
+        assert abs(got["rel"] - 1.3) < 0.05, (likes, got)
+    spread = max(r["abs"] for r in ratios.values()) - min(r["abs"] for r in ratios.values())
+    assert spread > 2.0, ratios          # absolute mode is not scale-free
+    print("ok  relative owner bonus is scale-invariant (%.2f-%.2f) while absolute "
+          "spans %.1fx" % (min(r["rel"] for r in ratios.values()),
+                           max(r["rel"] for r in ratios.values()), spread))
+
+
+def test_owner_bonus_mode_off_leaves_the_board_alone():
+    """`bonus_mode: "off"` removes the multiplier and the bonus: the operator is
+    an ordinary author on the score, whatever the interleave does with the slot."""
+    owner = "did:plc:own"
+    posts = [post(likes=5, did=owner, key="own")] + [
+        post(likes=50, did="did:plc:u%d" % i, key="u%d" % i) for i in range(9)]
+    fcfg = {"rkey": "t", "max_posts": 50, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24, "ranking": "flat"}
+    ob = {"did": owner, "always_include": True, "boost": 1.3, "bonus": 9.0,
+          "bonus_mode": "off", "max_ratio": 0.5}
+    scored, _ = fg.select(posts, fcfg, NOW, ob, CTX, set())
+    sco = dict(scored)
+    own_uri = "at://%s/app.bsky.feed.post/own" % owner
+    others = sorted(v for k, v in sco.items() if k != own_uri)
+    assert sco[own_uri] < others[0], (sco[own_uri], others[:2])
+    assert abs(sco[own_uri] - fg.ranking_core.log_engagement(
+        post(likes=5, did=owner, key="own"), W)) < 1e-9
+    print("ok  bonus_mode=off drops boost and bonus, keeping the raw score")
+
+
+def test_chrono_ignores_owner_promotion():
+    """A timeline feed is a timeline: no boost, no bonus, whatever the config says."""
+    owner = "did:plc:own"
+    posts = [post(likes=1, did=owner, key="own", hours=5)] + [
+        post(likes=50, did="did:plc:u%d" % i, key="u%d" % i, hours=1 + i)
+        for i in range(5)]
+    fcfg = {"rkey": "t", "max_posts": 10, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24, "ranking": "chrono"}
+    ob = {"did": owner, "always_include": True, "boost": 9.0, "bonus": 99.0,
+          "bonus_mode": "relative", "bonus_frac": 5.0, "max_ratio": 0.5}
+    scored, _ = fg.select(posts, fcfg, NOW, ob, CTX, set())
+    sco = dict(scored)
+    own = sco["at://%s/app.bsky.feed.post/own" % owner]
+    assert -6.0 < own < -4.0, own      # -age_h, untouched by boost/bonus
+    print("ok  chrono keeps owner posts chronological (score %.2f)" % own)
+
+
 def test_owner_gate_bypass_can_be_disabled():
     """owner.gate_bypass: false keeps the owner's boost and cap but makes their
     posts clear the same floors as everyone else's."""
@@ -1448,6 +1523,9 @@ if __name__ == "__main__":
     test_extract_terms_and_negative_penalty()
     test_less_event_hides_post_and_sinks_author()
     test_every_feed_hides_seen_posts()
+    test_owner_bonus_mode_relative_is_scale_invariant()
+    test_owner_bonus_mode_off_leaves_the_board_alone()
+    test_chrono_ignores_owner_promotion()
     test_corpus_seed_is_config_gated()
     test_language_axis_and_author_cap_invariants()
     test_keyword_weights_learner_is_config_gated()
