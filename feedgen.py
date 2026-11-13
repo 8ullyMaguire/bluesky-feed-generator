@@ -1907,6 +1907,99 @@ def record_posts(posts):
     return len(rows)
 
 
+def engagement_poll_uris(limit=200):
+    """Board members worth re-polling, best score first, deduplicated.
+
+    A post's like count is whatever the AppView said when the post was fetched.
+    The crawl re-reads an author's recent posts anyway, but a post that made a
+    board and then went viral somewhere else keeps the old number until it is
+    asked about again — and the board keeps ranking it on that number.
+    """
+    try:
+        rows = db().execute(
+            "SELECT DISTINCT uri, score FROM board_scores ORDER BY score DESC"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    seen, out = set(), []
+    for uri, _score in rows:
+        if not uri or uri in seen:
+            continue
+        seen.add(uri)
+        out.append(uri)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def engagement_batches(uris, size=25):
+    """`getPosts` takes 25 URIs per call; keep the batching somewhere testable."""
+    return [uris[i:i + size] for i in range(0, len(uris), size)]
+
+
+def apply_engagement_refresh(posts):
+    """Fold freshly polled engagement into the DB and the in-memory corpus."""
+    n = 0
+    with DB_LOCK:
+        for p in posts:
+            uri = p.get("uri")
+            if not uri:
+                continue
+            lk = int(p.get("likeCount") or 0)
+            rp = int(p.get("repostCount") or 0)
+            qt = int(p.get("quoteCount") or 0)
+            rl = int(p.get("replyCount") or 0)
+            db().execute(
+                "UPDATE posts SET like_count=?, repost_count=?, quote_count=?, "
+                "reply_count=? WHERE uri=?", (lk, rp, qt, rl, uri))
+            n += db().execute("SELECT changes()").fetchone()[0]
+            live = (CORPUS.get("by_uri") or {}).get(uri)
+            if isinstance(live, dict):
+                live["likeCount"] = lk
+                live["repostCount"] = rp
+                live["quoteCount"] = qt
+                live["replyCount"] = rl
+    return n
+
+
+def refresh_candidate_engagement(now=None):
+    """Re-poll the board's top candidates so a board is not frozen at fetch time.
+
+    Budgeted and interval-gated: at most `max_posts` URIs per run, at most once
+    per `interval_secs`. Only engagement counts are read, so this is public and
+    needs no session.
+    """
+    cfg = CFG.get("engagement_refresh") or {}
+    if not cfg.get("enabled"):
+        return 0
+    now = time.time() if now is None else now
+    interval = float(cfg.get("interval_secs", 3600) or 3600)
+    try:
+        last = float(meta_get("engagement_refresh_at", 0) or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if now - last < interval:
+        return 0
+    uris = engagement_poll_uris(int(cfg.get("max_posts", 200) or 200))
+    if not uris:
+        return 0
+    host = (CFG.get("source") or {}).get("appview_host") or "https://public.api.bsky.app"
+    updated = 0
+    for batch in engagement_batches(uris):
+        q = urllib.parse.urlencode([("uris", u) for u in batch])
+        try:
+            d = rpc(host, "app.bsky.feed.getPosts?" + q, timeout=30)
+        except Exception as e:                              # noqa: BLE001
+            print(f"[{SVC_TAG}] engagement refresh failed: {e}", flush=True)
+            break
+        updated += apply_engagement_refresh(d.get("posts") or [])
+        time.sleep(0.2)
+    meta_set("engagement_refresh_at", now)
+    print(f"[{SVC_TAG}] engagement refresh: {len(uris)} candidates, "
+          f"{updated} updated", flush=True)
+    return updated
+
+
 def snapshot_engagements(posts, now=None):
     """Hourly engagement snapshots feeding the rediscovery track.
 
@@ -3644,6 +3737,7 @@ def refresh():
 
     record_posts(posts)
     snapshot_engagements(posts)
+    refresh_candidate_engagement()      # interval-gated; re-polls board members
     fetched = len(posts)
     _max_window = max(f.get("max_age_hours", 48) for f in CFG["feeds"])
     posts = merge_corpus(posts, _max_window)

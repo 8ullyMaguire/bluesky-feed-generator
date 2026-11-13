@@ -27,7 +27,8 @@ CREATE TABLE metrics_log (ts REAL, feed_rkey TEXT, posts INTEGER,
   unique_authors INTEGER, median_age_hours REAL, score_median REAL,
   score_p90 REAL, kw_hit_rate REAL, no_text_rate REAL, affinity_p50 REAL,
   engagement_gini REAL, engagement_median REAL, in_window INTEGER,
-  post_gate INTEGER, suppressed INTEGER, final INTEGER, served INTEGER);
+  post_gate INTEGER, suppressed INTEGER, final INTEGER, served INTEGER,
+  relaxed INTEGER);
 CREATE TABLE posts (uri TEXT PRIMARY KEY, author_did TEXT, like_count INTEGER);
 CREATE TABLE served_posts (requester_did TEXT, post_uri TEXT, feed_rkey TEXT,
   served_at REAL, polled_at REAL);
@@ -37,10 +38,10 @@ CREATE TABLE promotions (did TEXT, status TEXT);
 """)
 now = time.time()
 rows = [
-    (now - 3600, "a", 100, 40, 5.0, 1.0, 2.0, 0.5, 0.1, 0.2, 0.35, 10.0, 200, 120, 10, 100, 0),
-    (now - 60, "a", 90, 30, 6.0, 3.0, 4.0, 0.6, 0.1, 0.2, 0.40, 20.0, 180, 100, 20, 90, 0),
+    (now - 3600, "a", 100, 40, 5.0, 1.0, 2.0, 0.5, 0.1, 0.2, 0.35, 10.0, 200, 120, 10, 100, 0, 30),
+    (now - 60, "a", 90, 30, 6.0, 3.0, 4.0, 0.6, 0.1, 0.2, 0.40, 20.0, 180, 100, 20, 90, 0, 10),
 ]
-con.executemany("INSERT INTO metrics_log VALUES (%s)" % ",".join("?" * 17), rows)
+con.executemany("INSERT INTO metrics_log VALUES (%s)" % ",".join("?" * 18), rows)
 con.executemany("INSERT INTO posts VALUES (?,?,?)",
                 [("at://x/1", "did:plc:owner", 4), ("at://x/2", "did:plc:other", 9)])
 con.executemany("INSERT INTO served_posts VALUES (?,?,?,?,0)",
@@ -64,6 +65,7 @@ assert f["board_avg"] == 95.0 and f["board_min"] == 90, f
 assert f["short_share"] == 50.0, f            # one of two cycles below the cap
 assert f["gate_share"] == 57.9, f             # 220 / 380
 assert f["eng_median"] == 15.0, f             # (10 + 20) / 2
+assert f["relaxed_share"] == 18.2, f          # (30 + 10) / (120 + 100)
 assert f["fill_share"] == 86.4, f             # 190 / 220
 assert f["deliveries"] == 2 and f["readers"] == 1, f
 assert f["owner_share"] == 50.0, f            # one of two deliveries is the operator
@@ -73,7 +75,7 @@ assert rep["growth"]["members"] == {"probation": 1, "promoted": 1}, rep["growth"
 assert rep["growth"]["votes"] == 1 and rep["growth"]["promotions"] == {"promoted": 1}
 
 txt = wr.render(rep)
-assert "cross-feed duplicates: 1 of 2" in txt, txt
+assert "per-reader duplicates: 1 of 2" in txt, txt
 assert "feed" in txt and "cap" in txt
 print("weekly report aggregation ok")
 

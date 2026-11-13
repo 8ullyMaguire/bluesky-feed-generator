@@ -1390,6 +1390,33 @@ def test_keyword_weights_learner_is_config_gated():
     print("ok   keyword weights: config-gated seed, EMA learning, floors, terms")
 
 
+def test_engagement_refresh_updates_db_and_corpus():
+    """A board member's like count must be refreshable: the AppView is the only
+    source of truth for a post the crawl has moved past."""
+    uri = "at://did:plc:eng/app.bsky.feed.post/e1"
+    con = fg.db()
+    con.execute("INSERT OR REPLACE INTO posts(uri, author_did, indexed_at, text, "
+                "record_json, like_count, repost_count, reply_count, quote_count, "
+                "first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (uri, "did:plc:eng", NOW.isoformat(), "t", "{}", 3, 0, 0, 0,
+                 time.time(), time.time()))
+    con.execute("INSERT OR REPLACE INTO board_scores(ts, feed_rkey, pos, uri, "
+                "score) VALUES (?,?,?,?,?)", (time.time(), "t", 0, uri, 9.0))
+    fg.CORPUS["by_uri"] = {uri: {"uri": uri, "likeCount": 3, "repostCount": 0,
+                                 "quoteCount": 0, "replyCount": 0}}
+    n = fg.apply_engagement_refresh([{"uri": uri, "likeCount": 42,
+                                      "repostCount": 5, "quoteCount": 1,
+                                      "replyCount": 2}])
+    assert n == 1, n
+    row = con.execute("SELECT like_count, repost_count FROM posts WHERE uri=?",
+                      (uri,)).fetchone()
+    assert row[0] == 42 and row[1] == 5, row
+    assert fg.CORPUS["by_uri"][uri]["likeCount"] == 42
+    assert fg.engagement_poll_uris(5) == [uri]
+    assert [len(b) for b in fg.engagement_batches(list(range(60)))] == [25, 25, 10]
+    print("ok  engagement refresh updates the database and the live corpus")
+
+
 def test_relaxed_floor_admissions_are_counted():
     """A board that fills by lowering its likes floor must say how many posts it
     let through that way: that number is the difference between "tuned" and
@@ -1590,6 +1617,7 @@ if __name__ == "__main__":
     test_owner_bonus_mode_relative_is_scale_invariant()
     test_owner_bonus_mode_off_leaves_the_board_alone()
     test_chrono_ignores_owner_promotion()
+    test_engagement_refresh_updates_db_and_corpus()
     test_relaxed_floor_admissions_are_counted()
     test_rank_score_decomposition_multiplies_back_to_the_score()
     test_corpus_keeps_window_sourced_posts_past_the_cap()
