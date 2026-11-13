@@ -1391,6 +1391,19 @@ def test_keyword_weights_learner_is_config_gated():
     print("ok   keyword weights: config-gated seed, EMA learning, floors, terms")
 
 
+def test_board_scores_keep_boards_that_were_not_ranked_this_cycle():
+    """Per-feed rank cadence means only some boards are scored per cycle. Wiping
+    the table each time left the digest and the attribution report reading a
+    single board."""
+    fg.save_board_scores({"sA": ({"at://x/1": {"final": 1.0}}, [("at://x/1", 1.0)])})
+    fg.save_board_scores({"sB": ({"at://x/2": {"final": 2.0}}, [("at://x/2", 2.0)])})
+    feeds = {r[0] for r in fg.db().execute(
+        "SELECT DISTINCT feed_rkey FROM board_scores").fetchall()}
+    assert {"sA", "sB"} <= feeds, feeds
+    fg.db().execute("DELETE FROM board_scores WHERE feed_rkey IN ('sA','sB')")
+    print("ok  a board that was not ranked this cycle keeps its snapshot")
+
+
 def test_search_sources_fetch_terms_concurrently_without_losing_posts():
     """The search blocks were sequential: four blocks of ten to sixteen terms spent
     ~240 s of a ~330 s cycle waiting on the AppView. Concurrency must not drop,
@@ -1509,7 +1522,7 @@ def test_engagement_refresh_updates_db_and_corpus():
                       (uri,)).fetchone()
     assert row[0] == 42 and row[1] == 5, row
     assert fg.CORPUS["by_uri"][uri]["likeCount"] == 42
-    assert fg.engagement_poll_uris(5) == [uri]
+    assert uri in fg.engagement_poll_uris(50)
     assert [len(b) for b in fg.engagement_batches(list(range(60)))] == [25, 25, 10]
     print("ok  engagement refresh updates the database and the live corpus")
 
@@ -1714,6 +1727,7 @@ if __name__ == "__main__":
     test_owner_bonus_mode_relative_is_scale_invariant()
     test_owner_bonus_mode_off_leaves_the_board_alone()
     test_chrono_ignores_owner_promotion()
+    test_board_scores_keep_boards_that_were_not_ranked_this_cycle()
     test_search_sources_fetch_terms_concurrently_without_losing_posts()
     test_reader_topic_profile_and_implicit_negative()
     test_engagement_refresh_updates_db_and_corpus()

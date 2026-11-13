@@ -5580,8 +5580,15 @@ def save_board_scores(board_parts):
                              d.get("topic_mult"), d.get("taste_mult"),
                              d.get("prior"), d.get("final"), score,
                              1 if d.get("owner") else 0))
+        days = float((CFG.get("ranking") or {}).get("board_scores_days", 3) or 3)
         with DB_LOCK:
-            db().execute("DELETE FROM board_scores")
+            # Only the boards ranked in this cycle are rewritten; a board that is
+            # not due yet keeps its last snapshot. Wiping the table meant that a
+            # reader of the table (the digest, the attribution report) saw
+            # whichever single board happened to be ranked most recently.
+            for rkey in board_parts:
+                db().execute("DELETE FROM board_scores WHERE feed_rkey=?", (rkey,))
+            db().execute("DELETE FROM board_scores WHERE ts < ?", (ts - days * 86400,))
             db().executemany(
                 "INSERT OR REPLACE INTO board_scores(ts, feed_rkey, pos, uri, "
                 "track, log_eng, velocity, topic_mult, taste_mult, prior, "
