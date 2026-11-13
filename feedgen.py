@@ -53,6 +53,7 @@ of rewriting a JSON file on every pick. `feedgen-state.json` is migrated once
 on first start and kept as a backup.
 """
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -1820,7 +1821,17 @@ def fetch_search_posts(token=None):
         lang = b.get("lang")
         only = [str(x) for x in (b.get("feeds") or [])]
         got = 0
-        for term in terms:
+
+        def fetch_term(term):
+            """All pages of one term. Returns the tagged posts for it.
+
+            Runs under a small thread pool: the blocks are independent queries and
+            the sequential version spent most of a refresh cycle waiting on the
+            AppView (leftist ingest was ~240 s of a ~330 s cycle for four blocks
+            of ten to sixteen terms). Four workers keeps the request rate close to
+            what a single browser tab produces, so no rate-limit dance.
+            """
+            mine = []
             cursor = None
             n = 0
             for _ in range(pages):
@@ -1862,15 +1873,26 @@ def fetch_search_posts(token=None):
                         p["_src_protect"] = True
                     if only:
                         p["_src_feeds"] = list(only)
-                    out.append(p)
+                    mine.append(p)
                     n += 1
                 cursor = d.get("cursor")
                 if not cursor:
                     break
                 time.sleep(0.2)
+            return n, mine
+
+        results = []
+        workers = max(1, min(8, int(b.get("workers", 4) or 4)))
+        if workers == 1 or len(terms) == 1:
+            results = [fetch_term(t) for t in terms]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=workers) as pool:
+                results = list(pool.map(fetch_term, terms))
+        for term, (n, mine) in zip(terms, results):
             hit[term] = n
             got += n
-            time.sleep(0.2)
+            out.extend(mine)
         _src_mark(key)
         print(f"[{SVC_TAG}] search_source[{key}]: {got} posts from {len(terms)} terms"
               + (f" -> {','.join(only)}" if only else ""), flush=True)

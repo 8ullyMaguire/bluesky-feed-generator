@@ -14,6 +14,7 @@ import tempfile
 import time
 import base64
 import sqlite3
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 TMP = tempfile.mkdtemp(prefix="feedgen-rank-test-")
@@ -1390,6 +1391,50 @@ def test_keyword_weights_learner_is_config_gated():
     print("ok   keyword weights: config-gated seed, EMA learning, floors, terms")
 
 
+def test_search_sources_fetch_terms_concurrently_without_losing_posts():
+    """The search blocks were sequential: four blocks of ten to sixteen terms spent
+    ~240 s of a ~330 s cycle waiting on the AppView. Concurrency must not drop,
+    duplicate or mis-tag a post."""
+    old_cfg = fg.CFG.get("search_sources")
+    old_rpc, old_due = fg.rpc, fg._src_due
+    calls = []
+
+    def fake_rpc(host, method, data=None, token=None, timeout=30):
+        q = urllib.parse.parse_qs(method.split("?", 1)[1])
+        term = q["q"][0]
+        page = q.get("cursor", ["0"])[0]
+        calls.append((term, page))
+        ts = (NOW - timedelta(hours=1)).isoformat()
+        old = (datetime.now(timezone.utc) - timedelta(hours=200)).isoformat()
+        post = {"uri": "at://did:plc:s/%s-%s" % (term, page),
+                "indexedAt": old if page == "1" else ts,
+                "author": {"did": "did:plc:s"}, "record": {"text": term}}
+        return {"posts": [post], "cursor": None if page == "1" else "1"}
+
+    try:
+        fg.CFG["search_sources"] = [{
+            "name": "par", "enabled": True, "terms": ["a", "b", "c", "d", "e"],
+            "pages": 2, "limit": 10, "sort": "latest", "max_age_hours": 24,
+            "feeds": ["t"]}]
+        fg.rpc = fake_rpc
+        fg._src_due = lambda key, interval: True
+        posts, hit = fg.fetch_search_posts()
+        uris = [p["uri"] for p in posts]
+        # Page 0 is fresh and page 1 is 200 h old, so the cutoff keeps five and
+        # drops five — the point is that concurrency loses neither.
+        assert len(uris) == 5, (len(uris), sorted(uris))
+        assert len(set(uris)) == 5, "duplicate post URIs"
+        assert all(p["_src_key"] == "par" for p in posts)
+        assert all(p.get("_src_feeds") == ["t"] for p in posts)
+        assert not any(u.endswith("-1") for u in uris), "old page-1 post not filtered"
+        assert len(calls) == 10, calls
+        print("ok  concurrent search terms: %d posts, %d calls, no duplicates"
+              % (len(posts), len(calls)))
+    finally:
+        fg.CFG["search_sources"] = old_cfg
+        fg.rpc, fg._src_due = old_rpc, old_due
+
+
 def test_reader_topic_profile_and_implicit_negative():
     """Two weak signals, both available on this estate: what a reader's likes are
     about, and which authors they keep being shown and never touch."""
@@ -1669,6 +1714,7 @@ if __name__ == "__main__":
     test_owner_bonus_mode_relative_is_scale_invariant()
     test_owner_bonus_mode_off_leaves_the_board_alone()
     test_chrono_ignores_owner_promotion()
+    test_search_sources_fetch_terms_concurrently_without_losing_posts()
     test_reader_topic_profile_and_implicit_negative()
     test_engagement_refresh_updates_db_and_corpus()
     test_relaxed_floor_admissions_are_counted()
