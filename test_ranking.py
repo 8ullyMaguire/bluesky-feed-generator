@@ -249,6 +249,49 @@ def test_owner_gate_bypass_can_be_disabled():
     print("ok  owner.gate_bypass=false puts owner posts through the gates")
 
 
+def test_sources_allowlist_refuses_the_list():
+    """A board that means "all Spanish posts" cannot be built from a follow list.
+    `sources` is an allowlist on provenance: anything unlisted — the list crawl,
+    an old DB row with no provenance — is not a candidate."""
+    posts = [
+        post(likes=100, did="did:plc:search", key="from-search", langs=["es"]),
+        post(likes=100, did="did:plc:list", key="from-list", langs=["es"]),
+        post(likes=100, did="did:plc:old", key="from-db", langs=["es"]),
+    ]
+    posts[0]["_src_key"] = "es-day"
+    posts[1]["_src_key"] = "list"
+    base = {"max_posts": 50, "max_per_author": 0, "min_age_hours": 0,
+            "max_age_hours": 24, "min_likes": 0, "adaptive_target": 0,
+            "require_lang": ["es"]}
+    fcfg = dict(base, rkey="feed-es", sources=["es-day", "owner"])
+    keys = {u.rsplit("/", 1)[-1] for u, _s in fg.select(posts, fcfg, NOW,
+                                                        {"did": "did:plc:own"}, CTX, set())[0]}
+    assert keys == {"from-search"}, keys
+
+    fcfg_any = dict(base, rkey="feed-es")
+    keys_any = {u.rsplit("/", 1)[-1] for u, _s in fg.select(posts, fcfg_any, NOW,
+                                                            {"did": "did:plc:own"}, CTX, set())[0]}
+    assert keys_any == {"from-search", "from-list", "from-db"}, keys_any
+    print("ok  sources allowlist refuses the list (and untagged rows)")
+
+
+def test_flat_ranking_has_no_time_decay():
+    """`flat` is pure engagement: a popular 20-hour-old post must beat a weak
+    fresh one on a board that means "popular today"."""
+    w = fg.CFG["scoring"]
+    fcfg = {"ranking": "flat", "max_age_hours": 24}
+    strong_old = fg.rank_score(post(likes=400, hours=20), fcfg, w, 20.0, CTX)
+    weak_new = fg.rank_score(post(likes=2, hours=0.2), fcfg, w, 0.2, CTX)
+    assert strong_old > weak_new * 2, (strong_old, weak_new)
+    vel = {"ranking": "velocity", "gravity": 0.4, "half_life_hours": 2.0,
+           "max_age_hours": 24}
+    strong_old_v = fg.rank_score(post(likes=400, hours=20), vel, w, 20.0, CTX)
+    weak_new_v = fg.rank_score(post(likes=2, hours=0.2), vel, w, 0.2, CTX)
+    assert strong_old_v < weak_new_v or strong_old_v < strong_old, \
+        "velocity mode is supposed to trade engagement for freshness"
+    print("ok  flat ranking ignores age; velocity mode does not")
+
+
 def test_corpus_cap_comes_from_config():
     """The cap trims by recency, so it decides how many hours a long board can
     see. It must be settable from config, and must fall back when unset."""
@@ -1367,6 +1410,8 @@ if __name__ == "__main__":
     test_hide_seen_scope_can_be_per_feed()
     test_topic_post_floor_is_continuous()
     test_owner_gate_bypass_can_be_disabled()
+    test_sources_allowlist_refuses_the_list()
+    test_flat_ranking_has_no_time_decay()
     test_corpus_cap_comes_from_config()
     test_source_can_be_scoped_to_named_feeds()
     test_search_blocks_normalise_both_shapes()

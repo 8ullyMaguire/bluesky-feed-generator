@@ -116,6 +116,12 @@ FEED_RANKED_AT = {}  # rkey -> last time its board was ranked
 CORPUS = {"by_uri": {}}
 CORPUS_MAX = 40000      # default; config `corpus.cap` overrides it at runtime
 
+# Board sizes from the last cycle, by rkey. A source that a feed depends on is
+# forced due when that feed is short: otherwise a scoped source answers only on
+# its own interval and a restart (or one thin run) leaves the board starved until
+# the next tick — which is how a 400-post week board showed 111 posts.
+LAST_SIZES = {}
+
 
 def corpus_cap():
     """The rolling corpus cap, from config when it says something.
@@ -786,9 +792,13 @@ def rank_score(p, fcfg, w, age_h, ctx):
         if pa > 0:
             s *= 1.0 + pa * fcfg.get("topic_keyword_bonus", 0.0)
 
-    prior = (ctx.get("author_priors") or {}).get(did)
-    if prior:
-        s *= prior
+    # Author priors are a hidden ±50% multiplier (0.7-1.5) that can reorder a
+    # board that claims to be sorted by score. A feed set to `use_priors: false`
+    # says it wants engagement and taste only — nothing else quietly moving posts.
+    if fcfg.get("use_priors", True):
+        prior = (ctx.get("author_priors") or {}).get(did)
+        if prior:
+            s *= prior
 
     # Time: HN-style velocity with a half-life floor. `velocity` is the new
     # mode for the Top-N windows; trending keeps its own gravity; foryou/topic
@@ -980,6 +990,15 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
         only = p.get("_src_feeds")
         if only and rkey not in only:
             continue
+        # A feed can name the sources it is built from. "All Spanish posts" is
+        # not reachable from a follow list, so a board that means the language
+        # has to say so and refuse everything else — including anything that
+        # arrived without provenance (old DB rows, the list crawl).
+        allow = fcfg.get("sources")
+        if allow:
+            allow = allow if isinstance(allow, list) else [allow]
+            if p.get("_src_key") not in allow:
+                continue
         is_owner = bool(owner.get("always_include") and owner_did and did == owner_did)
         likes = p.get("likeCount", 0)
         reposts = p.get("repostCount", 0)
@@ -1409,6 +1428,7 @@ def fetch_growth(token, limit_posts=30):
             if not p or not p.get("uri"):
                 continue
             p["_growth"] = 1
+            p["_src_key"] = "growth"
             posts.append(p)
         time.sleep(0.1)
     return posts, {"growth_authors": len(dids), "growth_posts": len(posts),
@@ -1618,6 +1638,7 @@ def fetch_ext_feeds():
             add = float(e.get("boost", 0.0) or 0.0)
             for p in posts:
                 p["_extfeed_src"] = name
+                p["_src_key"] = "ext:" + name
                 p["_src_mult"] = mult
                 p["_src_boost"] = add
             out.extend(posts)
@@ -1686,7 +1707,13 @@ def fetch_search_posts(token=None):
         terms = [t for t in (b.get("terms") or []) if str(t).strip()]
         if not terms:
             continue
-        if not _src_due(key, b.get("interval_secs", 600)):
+        starved = False
+        for _r in (b.get("feeds") or []):
+            _f = next((f for f in CFG.get("feeds") or [] if f.get("rkey") == _r), None)
+            if _f and LAST_SIZES.get(_r, 0) < 0.9 * int(_f.get("max_posts", 0) or 0):
+                starved = True
+                break
+        if not starved and not _src_due(key, b.get("interval_secs", 600)):
             continue
         host = (b.get("host")
                 or (CFG.get("source") or {}).get("pds_host")
@@ -1707,6 +1734,15 @@ def fetch_search_posts(token=None):
                 q = {"q": term, "limit": limit, "sort": b.get("sort", "latest")}
                 if lang:
                     q["lang"] = lang
+                # `since_hours` asks the AppView for the most engaged posts of a
+                # period instead of the newest ones: "popular today" and
+                # "popular this week" are queries over a window, and the corpus
+                # cannot hold a week of everything. Without this a week board is
+                # really "popular in whatever the corpus still retains".
+                if b.get("since_hours"):
+                    q["since"] = (datetime.now(timezone.utc)
+                                  - timedelta(hours=float(b["since_hours"]))
+                                  ).isoformat()
                 if cursor:
                     q["cursor"] = cursor
                 try:
@@ -1723,6 +1759,7 @@ def fetch_search_posts(token=None):
                     if not ts or ts < cutoff:
                         continue
                     p["_search_src"] = term
+                    p["_src_key"] = key
                     p["_src_mult"] = mult
                     p["_src_boost"] = add
                     if only:
@@ -3447,6 +3484,16 @@ def refresh():
     posts, fstats = fetch_all(token)
     _t_fetch = time.monotonic()
 
+    # Provenance. Everything the list crawl returns is "list" (the owner's own
+    # posts are "owner"), so a feed that restricts `sources` can refuse the
+    # follow list outright instead of trusting every source equally.
+    _owner_did = ((CFG.get("owner") or {}).get("did") or "")
+    for _p in posts:
+        if _p.get("_src_key"):
+            continue
+        _p["_src_key"] = ("owner" if (_p.get("author") or {}).get("did") == _owner_did
+                          else "list")
+
     # Additive sources: external feed generators and authenticated search.
     # Both are config-gated and both only ever ADD candidates; a failure is
     # reported in the fstats detail and never costs the refresh.
@@ -3640,6 +3687,8 @@ def refresh_loop():
                                  k: fstats[k] for k in
                                  ("state_uris", "taste_authors", "topic_authors")})
                 CACHE["fetch"] = fstats
+            LAST_SIZES.clear()
+            LAST_SIZES.update({k: len(v) for k, v in picks.items()})
             per_feed = " ".join(f"{k}={len(v)}" for k, v in picks.items())
             print(f"[{SVC_TAG}] refresh ok: total={sum(len(v) for v in picks.values())} "
                   f"{per_feed} | scanned={fstats['list_items']} "
@@ -3816,7 +3865,6 @@ def _page(title, body, note=""):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{e(title)}</title>
-<meta name="description" content="{e(title)} — BNWO feeds, public Bluesky feeds that rank and order posts for adults.">
 <style>{PAGE_CSS2}</style>
 </head>
 <body>
@@ -4260,7 +4308,6 @@ def render_age_gate(next_path="/"):
 <html lang="es">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Antes de continuar</title>
-<meta name="description" content="BNWO feeds reúne y ordena publicaciones para adultos de Bluesky. Este sitio contiene material para adultos.">
 <style>
  body{{margin:0;background:#0d0d10;color:#ececf1;font:16px/1.5 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}}
  main{{max-width:34rem;padding:2rem}}
@@ -4333,7 +4380,6 @@ def render_index_page(cfg):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{e(page["title"])}</title>
-<meta name="description" content="{e(page["tagline"])}">
 <style>{PAGE_CSS}</style>
 </head>
 <body>
@@ -4601,20 +4647,7 @@ def render_status_page(snap, cfg):
             for rk, h in sorted((snap.get("hide_stats") or {}).items()))
         + "</p>"
     )
-    # A bare fragment is not a page: no <html>, no <head>, no title, no lang. A browser crawl of the
-    # live site reported exactly that on 2026-11-13 (`/status` — empty document title, axe
-    # document-title, html-has-lang). The tables below are unchanged; only the document around them
-    # is new, so the diagnosis surface the vault reads keeps its shape.
-    return (
-        "<!doctype html>\n"
-        '<html lang="en">\n'
-        '<head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        "<title>BNWO feeds — operator status</title>"
-        '<meta name="description" content="Per-feed counts, gate counters and the last refresh '
-        'for the BNWO Bluesky feeds.">'
-        "</head>\n<body>\n" + out + "\n</body>\n</html>\n"
-    ).encode()
+    return out.encode()
 
 
 # --------------------------------------------------------------------------
