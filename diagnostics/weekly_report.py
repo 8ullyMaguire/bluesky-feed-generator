@@ -47,7 +47,7 @@ def pct(part, whole):
 def load_metrics(con, since):
     """Per-feed aggregates over the window, from one row per cycle."""
     out = {}
-    for r in q(con, """
+    sql = """
             SELECT feed_rkey, COUNT(*) AS cycles,
                    AVG(posts) AS board_avg, MIN(posts) AS board_min,
                    AVG(score_median) AS score_median,
@@ -58,16 +58,31 @@ def load_metrics(con, since):
                    AVG(in_window) AS in_window,
                    AVG(post_gate) AS post_gate,
                    AVG(suppressed) AS suppressed,
-                   AVG(final) AS final
+                   AVG(final) AS final, AVG(relaxed) AS relaxed
             FROM metrics_log WHERE ts >= ? GROUP BY feed_rkey
-            ORDER BY feed_rkey""", (since,)):
+            ORDER BY feed_rkey"""
+    try:
+        rows = con.execute(sql, (since,)).fetchall()
+    except sqlite3.Error:
+        # A database from before the relaxed counter: report the rest rather
+        # than nothing. An older shape still missing other columns reports
+        # nothing, which is the honest answer.
+        try:
+            rows = con.execute(
+                sql.replace("AVG(relaxed) AS relaxed", "0 AS relaxed"),
+                (since,)).fetchall()
+        except sqlite3.Error:
+            rows = []
+    for r in rows:
         d = dict(r)
         iw, pg, fin = d.get("in_window") or 0, d.get("post_gate") or 0, d.get("final") or 0
+        d["relaxed_share"] = pct(d.get("relaxed") or 0, pg)
         d["gate_share"] = pct(pg, iw)
         d["fill_share"] = pct(fin, pg)
         d["suppressed_share"] = pct(d.get("suppressed") or 0, pg)
         for k in ("board_avg", "board_min", "score_median", "score_p90", "eng_median",
-                  "gini", "authors", "in_window", "post_gate", "suppressed", "final"):
+                  "gini", "authors", "in_window", "post_gate", "suppressed",
+                  "final", "relaxed"):
             if d.get(k) is not None:
                 d[k] = round(float(d[k]), 2)
         out[d["feed_rkey"]] = d
@@ -131,6 +146,9 @@ def duplicates(con, since, limit=10):
               GROUP BY requester_did, post_uri)""", (since,))
     total = (row[0]["pairs"] or 0) if row else 0
     multi = (row[0]["multi"] or 0) if row else 0
+    # Two different questions, and mixing them up is how a duplicate report
+    # lies: `share` is per reader (does one person get the same post twice),
+    # `top` is population-level (which posts travel across many boards).
     top = [dict(r) for r in q(con, """
         SELECT post_uri, COUNT(DISTINCT feed_rkey) AS feeds,
                COUNT(*) AS deliveries
@@ -190,6 +208,7 @@ def build(con, config, days=7.0, now=None):
             "final": m["final"],
             "fill_share": m["fill_share"],
             "suppressed_share": m["suppressed_share"],
+            "relaxed_share": m["relaxed_share"],
             "deliveries": rep.get("deliveries", 0),
             "readers": rep.get("readers", 0),
             "delivered_likes_avg": rep.get("likes_avg"),
@@ -204,9 +223,9 @@ def render(rep):
     add = lines.append
     add("feed estate — last %g days (since %s)" % (rep["days"], rep["generated_at"]))
     add("")
-    hdr = ("%-20s %5s %6s %6s %6s %6s %6s %6s %5s %5s %6s %6s %6s %7s"
+    hdr = ("%-20s %5s %6s %6s %6s %6s %6s %6s %5s %5s %6s %6s %6s %6s %7s"
            % ("feed", "cap", "board", "min", "short%", "score", "p90", "eng",
-              "gini", "auth", "gate%", "fill%", "owner%", "deliv"))
+              "gini", "auth", "gate%", "fill%", "relax%", "owner%", "deliv"))
     add(hdr)
     add("-" * len(hdr))
     for rkey in sorted(rep["feeds"]):
@@ -216,21 +235,24 @@ def render(rep):
             v = f.get(k)
             return d if v is None else (("%.1f" % v) if isinstance(v, float) else str(v))
 
-        add("%-20s %5s %6s %6s %6s %6s %6s %6s %6s %5s %6s %6s %6s %7s"
+        add("%-20s %5s %6s %6s %6s %6s %6s %6s %6s %5s %6s %6s %6s %6s %7s"
             % (rkey, f.get("cap"), g("board_avg"), g("board_min"), g("short_share"),
                g("score_median"), g("score_p90"), g("eng_median"), g("gini"),
-               g("authors"), g("gate_share"), g("fill_share"), g("owner_share"),
-               g("deliveries")))
+               g("authors"), g("gate_share"), g("fill_share"), g("relaxed_share"),
+               g("owner_share"), g("deliveries")))
     add("")
     add("column notes: board/min = posts per cycle; short% = cycles below cap (the likes")
     add("floor relaxed); score/p90/eng = board medians; gini = engagement concentration;")
     add("gate% = in_window that passed the gates; fill% = gated posts that made the board;")
+    add("relax% = gated posts admitted under a lowered likes floor (supply-bound, not tuned);")
     add("owner% = share of deliveries written by the operator; deliv = deliveries in the")
     add("window, so a small deliv makes owner% noise rather than a policy leak.")
     add("")
     d = rep["duplicates"]
-    add("cross-feed duplicates: %s of %s reader-post pairs were served by 2+ feeds (%s%%)"
+    add("per-reader duplicates: %s of %s reader-post pairs came from 2+ feeds (%s%%)"
         % (d["multi_feed"], d["pairs"], d["share"]))
+    if d["top"]:
+        add("posts that travel across boards (any reader):")
     for t in d["top"][:5]:
         add("   %-3s feeds  %s" % (t["feeds"], t["post_uri"]))
     gr = rep["growth"]
