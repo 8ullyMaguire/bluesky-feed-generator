@@ -3815,6 +3815,8 @@ a.gh .star { font-size: 1.05em; }
 
 
 PAGE_CSS2 = """
+table{max-width:100%;border-collapse:collapse;font-size:.85em}
+th,td{padding:2px 4px;overflow-wrap:anywhere}
 body { margin: 0; background: #12100e; color: #ece7df;
        font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif; }
 main { max-width: 54rem; margin: 0 auto; padding: 2rem 1.1rem 4rem; }
@@ -3856,15 +3858,20 @@ section > h2 { border-top: 1px solid rgba(236,231,223,.12); padding-top: 1.5rem;
 """
 
 
-def _page(title, body, note=""):
-    """One shared shell for the new pages. The <style> is inlined, never linked."""
+def _page(title, body, note="", desc=""):
+    """One shared shell for the new pages. The <style> is inlined, never linked.
+
+    `desc` is required in spirit: every page here used to be published without a
+    meta description, which is the one line a search result and a link preview quote."""
     e = html.escape
+    desc = desc or f"{title} — top-posts feeds de Bluesky, con los criterios a la vista."
     return f"""<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{e(title)}</title>
+<meta name="description" content="{e(desc)}">
 <style>{PAGE_CSS2}</style>
 </head>
 <body>
@@ -4308,6 +4315,7 @@ def render_age_gate(next_path="/"):
 <html lang="es">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Antes de continuar</title>
+<meta name="description" content="Declaración de edad antes de ver el contenido: este sitio es para adultos y el acceso se guarda como una cookie tuya, no como un registro nuestro.">
 <style>
  body{{margin:0;background:#0d0d10;color:#ececf1;font:16px/1.5 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}}
  main{{max-width:34rem;padding:2rem}}
@@ -4380,6 +4388,7 @@ def render_index_page(cfg):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{e(page["title"])}</title>
+<meta name="description" content="{e(page["tagline"])}">
 <style>{PAGE_CSS}</style>
 </head>
 <body>
@@ -4647,7 +4656,13 @@ def render_status_page(snap, cfg):
             for rk, h in sorted((snap.get("hide_stats") or {}).items()))
         + "</p>"
     )
-    return out.encode()
+    # A fragment is not a page. /status was answering with this body alone, so the browser got no doctype,
+    # no lang, no title and no description — measured 2026-11-13 by the estate crawler, which could not read
+    # the page's own title because the page had none.
+    return _page("Estado del servicio", out,
+                 "Contadores de la última actualización.",
+                 "Estado del servicio: métricas por feed, la tubería de cada uno y los contadores "
+                 "de la última actualización.")
 
 
 # --------------------------------------------------------------------------
