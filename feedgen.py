@@ -579,6 +579,13 @@ CREATE TABLE IF NOT EXISTS bot_runs (
     dry_run         INTEGER DEFAULT 1,
     note            TEXT
 );
+CREATE TABLE IF NOT EXISTS board_scores (
+    ts REAL NOT NULL, feed_rkey TEXT NOT NULL, pos INTEGER NOT NULL,
+    uri TEXT NOT NULL, track TEXT, log_eng REAL, velocity REAL,
+    topic_mult REAL, taste_mult REAL, prior REAL, final REAL, score REAL,
+    owner INTEGER DEFAULT 0,
+    PRIMARY KEY (feed_rkey, pos)
+);
 CREATE TABLE IF NOT EXISTS metrics_log (
     ts REAL NOT NULL, feed_rkey TEXT NOT NULL, posts INTEGER,
     unique_authors INTEGER, median_age_hours REAL,
@@ -586,6 +593,7 @@ CREATE TABLE IF NOT EXISTS metrics_log (
     kw_hit_rate REAL, no_text_rate REAL, affinity_p50 REAL,
     engagement_gini REAL,
     engagement_median REAL,
+    relaxed INTEGER DEFAULT 0,
     PRIMARY KEY (ts, feed_rkey))
 """
 
@@ -620,7 +628,8 @@ def migrate_schema():
         # rendered /status page.
         ml = {r[1] for r in db().execute(
             "PRAGMA table_info(metrics_log)").fetchall()}
-        for col in ("in_window", "post_gate", "suppressed", "final", "served"):
+        for col in ("in_window", "post_gate", "suppressed", "final", "served",
+                    "relaxed"):
             if col not in ml:
                 db().execute(
                     f"ALTER TABLE metrics_log ADD COLUMN {col} INTEGER DEFAULT 0")
@@ -766,7 +775,7 @@ def topic_keyword_hits(text, keywords):
     return sum(1 for k in keywords if k in low)
 
 
-def rank_score(p, fcfg, w, age_h, ctx):
+def rank_score(p, fcfg, w, age_h, ctx, parts=None):
     """Apply the feed's ranking mode + affinity modifiers to a base score.
 
     This is the GLOBAL baseline only — per-user personalization happens at
@@ -778,8 +787,16 @@ def rank_score(p, fcfg, w, age_h, ctx):
     if mode == "chrono":
         # "What just happened": newest first, no engagement and no taste.
         # A timeline feed, not a ranked one.
+        if parts is not None:
+            parts.update(mode="chrono", log_eng=None, velocity=None,
+                         topic_mult=1.0, taste_mult=1.0, prior=1.0,
+                         final=-age_h)
         return -age_h
     s = ranking_core.log_engagement(p, w)
+    if parts is not None:
+        parts.clear()
+        parts.update(mode=mode, log_eng=round(s, 4), velocity=1.0,
+                     topic_mult=1.0, taste_mult=1.0, prior=1.0)
     did = (p.get("author") or {}).get("did") or "?"
 
     topicw = fcfg.get("topic_weight", 0.0)
@@ -796,8 +813,12 @@ def rank_score(p, fcfg, w, age_h, ctx):
             aff = 1.0
         if topicw:
             s *= 1.0 + topicw * aff
+            if parts is not None:
+                parts["topic_mult"] = round(1.0 + topicw * aff, 4)
         if taw:
             s *= 1.0 + taw * ta
+            if parts is not None:
+                parts["taste_mult"] = round(1.0 + taw * ta, 4)
         if mode == "topic" and did in ctx["topic_seeds"]:
             s += fcfg.get("topic_seed_bonus", 0.0)
         text = (p.get("record") or {}).get("text", "") if isinstance(
@@ -815,6 +836,8 @@ def rank_score(p, fcfg, w, age_h, ctx):
         prior = (ctx.get("author_priors") or {}).get(did)
         if prior:
             s *= prior
+            if parts is not None:
+                parts["prior"] = round(prior, 4)
 
     # Time: HN-style velocity with a half-life floor. `velocity` is the new
     # mode for the Top-N windows; trending keeps its own gravity; foryou/topic
@@ -822,9 +845,14 @@ def rank_score(p, fcfg, w, age_h, ctx):
     if mode == "trending":
         s *= ranking_core.velocity(age_h, fcfg.get("decay_factor", 0.8))
     elif mode in ("velocity", "deep", "foryou", "topic"):
-        s *= ranking_core.velocity(
+        v = ranking_core.velocity(
             age_h, fcfg.get("gravity", fcfg.get("decay_factor", 0.6)),
             fcfg.get("half_life_hours", 2.0))
+        s *= v
+        if parts is not None:
+            parts["velocity"] = round(v, 4)
+    if parts is not None:
+        parts["final"] = round(s, 4)
     return s
 
 
@@ -948,7 +976,7 @@ def owner_lang_blocked(p, fcfg, mode):
     return lang_blocked(p, fcfg)
 
 
-def select(posts, fcfg, now, owner, ctx, suppressed):
+def select(posts, fcfg, now, owner, ctx, suppressed, parts_by_uri=None):
     """Rank the posts for one feed. Returns (uris, stats).
 
     `suppressed` is the set of URIs currently inside this feed's suppression
@@ -969,6 +997,7 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
     gate_mode = fcfg.get("gate_mode", "all")
     stats = {"in_window": 0, "pass_share": 0, "pass_gates": 0,
              "suppressed": 0, "final": 0, "owner": 0, "owner_lang": 0,
+             "relaxed": 0,
              "vintage_cands": 0, "vintage_picked": 0, "over_max_likes": 0,
              "topic_floor": 0, "topic_unjudged": 0}
     ranking_mode = fcfg.get("ranking", "flat")
@@ -1145,8 +1174,13 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
                     continue          # stagnation scores nothing
                 stats["vintage_cands"] += 1
                 track[uri] = "vintage"
+                if parts_by_uri is not None:
+                    parts = {"mode": "vintage", "log_eng": None, "velocity": None,
+                             "topic_mult": 1.0, "taste_mult": 1.0, "prior": 1.0,
+                             "final": round(s, 4)}
             else:
-                s = rank_score(p, fcfg, w, age_h, ctx)
+                parts = {} if parts_by_uri is not None else None
+                s = rank_score(p, fcfg, w, age_h, ctx, parts=parts)
                 if uri:
                     track[uri] = "fresh"
             # Source weighting: posts contributed by an external feed or a
@@ -1167,6 +1201,12 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
                 if not ok:
                     continue
             stats["pass_gates"] += 1
+            # A post that cleared a *relaxed* floor is not the post the feed's
+            # description promises. Counting it is how "the floor is real" stops
+            # being an assumption: a board whose relaxed share is high is
+            # supply-bound, not tuned, and the weekly report can say so.
+            if max_likes_gate and likes < max_likes_gate:
+                stats["relaxed"] += 1
             uri = p.get("uri")
             if not uri:
                 continue
@@ -1177,7 +1217,8 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
             # The owner's promotion is applied after every candidate is scored,
             # because the honest bonus depends on the board it lands on. See the
             # block below the loop.
-            s = rank_score(p, fcfg, w, age_h, ctx)
+            parts = {} if parts_by_uri is not None else None
+            s = rank_score(p, fcfg, w, age_h, ctx, parts=parts)
             stats["owner"] += 1
             stats["pass_share"] += 1
             stats["pass_gates"] += 1
@@ -1188,6 +1229,11 @@ def select(posts, fcfg, now, owner, ctx, suppressed):
         if did != owner_did:
             non_owner_n += 1
         cands.append((s, uri, did))
+        if parts_by_uri is not None:
+            # The score's own factors, so a board can be explained later instead
+            # of recomputed from a corpus that has moved on.
+            parts_by_uri[uri] = dict(parts or {}, track=track.get(uri, "fresh"),
+                                     owner=(did == owner_did))
 
     # --- owner promotion, scaled to the board it lands on ---------------
     # A flat bonus is not a nudge: measured on the live boards, a +3.0 sat at or
@@ -2995,16 +3041,16 @@ def log_metrics(picks_by_feed, feed_scores, now_ts, stats=None):
                             int(st.get("pass_gates", 0) or 0),
                             int(st.get("suppressed", 0) or 0),
                             len(picks_by_feed.get(rkey) or []),
-                            int(served))
+                            int(served), int(st.get("relaxed", 0) or 0))
         with DB_LOCK:
             db().executemany(
                 "INSERT OR REPLACE INTO metrics_log(ts, feed_rkey, posts, "
                 "unique_authors, median_age_hours, score_median, score_p90, "
                 "kw_hit_rate, no_text_rate, affinity_p50, engagement_gini, "
                 "engagement_median, "
-                "in_window, post_gate, suppressed, final, served) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [tuple(r) + funnel.get(r[1], (0, 0, 0, 0, 0)) for r in rows])
+                "in_window, post_gate, suppressed, final, served, relaxed) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [tuple(r) + funnel.get(r[1], (0, 0, 0, 0, 0, 0)) for r in rows])
             db().execute("DELETE FROM metrics_log WHERE ts < ?",
                          (ts - 90 * 86400,))
         print(f"[{SVC_TAG}] metrics logged for {len(rows)} feeds", flush=True)
@@ -3635,6 +3681,7 @@ def refresh():
 
     _t_rank0 = time.monotonic()
     picks, stats, feed_scores = {}, {}, {}
+    board_parts = {}
     prev_feeds = dict(CACHE.get("feeds") or {})
     prev_stats = dict(CACHE.get("stats") or {})
     shown = []
@@ -3657,8 +3704,9 @@ def refresh():
                 (f["rkey"], now_ts - ttl * 3600)).fetchall()
             suppressed = {r[0] for r in rows}
         _t_feed = time.monotonic()
+        _parts = {}
         scored, st = select(posts, f, now, feed_owner(owner, f), ctx,
-                            suppressed)
+                            suppressed, parts_by_uri=_parts)
         # Per-feed cost, so "the ranker scans the corpus once per feed" can be
         # confirmed or dismissed with a number instead of an intuition. Only the
         # expensive feeds print; a quiet cycle stays one line.
@@ -3668,6 +3716,7 @@ def refresh():
             fstats.setdefault("slow_feeds", {})[f["rkey"]] = int(feed_ms)
         picks[f["rkey"]] = [u for u, _s in scored]
         feed_scores[f["rkey"]] = {u: s for u, s in scored}
+        board_parts[f["rkey"]] = (_parts, scored)
         stats[f["rkey"]] = st | {"suppressed_set": len(suppressed), "ttl": ttl}
         shown.extend((f["rkey"], u) for u in picks[f["rkey"]])
 
@@ -3714,6 +3763,7 @@ def refresh():
             "author_priors": dict(priors),
             "topic_keywords": ctx["topic_keywords"],
         }
+    save_board_scores(board_parts)
     log_metrics(CACHE["feeds"], CACHE.get("feed_scores") or {}, time.time(),
                 stats=stats)
     fstats["state_uris"] = total_seen
@@ -5277,6 +5327,40 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
+
+def save_board_scores(board_parts):
+    """Persist the score decomposition of each board's members.
+
+    Without this, "why is this post here" is answered by re-running the ranker
+    against a corpus that has since moved, which is a different question. Every
+    board member is stored, with the factors rank_score() actually applied, so
+    the attribution is evidence rather than a reconstruction. Best-effort: a
+    failure to persist must never fail a refresh that succeeded.
+    """
+    if not board_parts:
+        return 0
+    ts = time.time()
+    try:
+        rows = []
+        for rkey, (parts, scored) in board_parts.items():
+            for pos, (uri, score) in enumerate(scored):
+                d = parts.get(uri) or {}
+                rows.append((ts, rkey, pos, uri, d.get("track"),
+                             d.get("log_eng"), d.get("velocity"),
+                             d.get("topic_mult"), d.get("taste_mult"),
+                             d.get("prior"), d.get("final"), score,
+                             1 if d.get("owner") else 0))
+        with DB_LOCK:
+            db().execute("DELETE FROM board_scores")
+            db().executemany(
+                "INSERT OR REPLACE INTO board_scores(ts, feed_rkey, pos, uri, "
+                "track, log_eng, velocity, topic_mult, taste_mult, prior, "
+                "final, score, owner) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        return len(rows)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[{SVC_TAG}] board score save failed: {e}", flush=True)
+        return 0
 
 
 def save_boards(picks):

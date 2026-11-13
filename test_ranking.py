@@ -1390,6 +1390,42 @@ def test_keyword_weights_learner_is_config_gated():
     print("ok   keyword weights: config-gated seed, EMA learning, floors, terms")
 
 
+def test_relaxed_floor_admissions_are_counted():
+    """A board that fills by lowering its likes floor must say how many posts it
+    let through that way: that number is the difference between "tuned" and
+    "supply-bound", and the weekly report has no other way to see it."""
+    posts = [post(likes=1, did="did:plc:r%d" % i, key="r%d" % i) for i in range(10)]
+    fcfg = {"rkey": "t", "max_posts": 10, "max_per_author": 0,
+            "min_age_hours": 0, "max_age_hours": 24, "min_likes": 5,
+            "adaptive_target": 20, "ranking": "flat"}
+    scored, st = fg.select(posts, fcfg, NOW, {"did": "did:plc:own"}, CTX, set())
+    assert len(scored) == 10, len(scored)
+    assert st["relaxed"] == 10, st
+    print("ok  relaxed floor admissions counted (%d)" % st["relaxed"])
+
+
+def test_rank_score_decomposition_multiplies_back_to_the_score():
+    """board_scores is only worth persisting if the stored factors reproduce the
+    score the ranker used. Seven multipliers and no check is how a board becomes
+    unauditable."""
+    p = post(likes=40, did="did:plc:dec", key="d1", hours=3)
+    fcfg = {"rkey": "t", "ranking": "velocity", "gravity": 0.5,
+            "half_life_hours": 12, "topic_weight": 1.0, "taste_weight": 0.4,
+            "max_age_hours": 24, "max_posts": 10, "use_priors": True}
+    ctx = dict(CTX, taste={"did:plc:dec": 0.5}, topic_affinity={"did:plc:dec": 0.4},
+               author_priors={"did:plc:dec": 1.2})
+    parts = {}
+    s = fg.rank_score(p, fcfg, W, 3.0, ctx, parts=parts)
+    rebuilt = (parts["log_eng"] * parts["velocity"] * parts["topic_mult"]
+               * parts["taste_mult"] * parts["prior"])
+    # The stored factors are rounded to 4 decimals, so the reconstruction is
+    # within a rounding error, not bit-identical.
+    assert abs(rebuilt - s) / max(1e-9, abs(s)) < 1e-3, (rebuilt, s, parts)
+    assert parts["topic_mult"] > 1 and parts["taste_mult"] > 1
+    assert parts["prior"] == 1.2
+    print("ok  decomposition multiplies back to the score (%.3f)" % s)
+
+
 def test_corpus_keeps_window_sourced_posts_past_the_cap():
     """A `since_hours` search exists to reach posts the rolling corpus cannot
     hold. The recency trim used to evict exactly those: the week source returned
@@ -1554,6 +1590,8 @@ if __name__ == "__main__":
     test_owner_bonus_mode_relative_is_scale_invariant()
     test_owner_bonus_mode_off_leaves_the_board_alone()
     test_chrono_ignores_owner_promotion()
+    test_relaxed_floor_admissions_are_counted()
+    test_rank_score_decomposition_multiplies_back_to_the_score()
     test_corpus_keeps_window_sourced_posts_past_the_cap()
     test_corpus_seed_is_config_gated()
     test_language_axis_and_author_cap_invariants()
