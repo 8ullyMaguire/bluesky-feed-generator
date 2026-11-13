@@ -123,9 +123,11 @@ finally:
     fg.rpc = real_rpc
     restore(old)
 
-# ---------------------------------------------------------------- search
+# --- search
+# The deployment config may carry `search_sources` (a list); these cases exercise
+# the single-block form, so they must clear the list or the list wins the merge.
 
-old = set_cfg(search_source={"enabled": False, "terms": ["x"]})
+old = set_cfg(search_source={"enabled": False, "terms": ["x"]}, search_sources=None)
 try:
     ok(fg.fetch_search_posts("tok")[0] == [], "search is off unless enabled")
 finally:
@@ -134,7 +136,7 @@ finally:
 search_config = {"enabled": True, "terms": ["demo"], "limit": 10, "pages": 1,
                  "max_age_hours": 24, "score_mult": 0.5, "interval_secs": 0,
                  "host": "https://pds.example"}
-old = set_cfg(search_source=search_config)
+old = set_cfg(search_source=search_config, search_sources=None)
 
 
 def fake_rpc_search(host, method, data=None, token=None, timeout=30):
