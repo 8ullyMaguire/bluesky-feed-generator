@@ -4679,6 +4679,134 @@ dijiste tener la edad, y se vuelve a preguntar en 30 días.</p>
 </main></body></html>""".encode()
 
 
+def feed_language(cfg, f):
+    """The language a feed serves, for the machine-readable listings.
+
+    The deployment is Spanish-first and two of its feeds are Spanish-only, so this
+    cannot be a deployment-wide constant: a client that wants only English posts
+    needs to know which feeds qualify without reading the descriptions.
+    """
+    rkey = f.get("rkey") or ""
+    if f.get("language"):
+        return f["language"]
+    if "-es-" in rkey or rkey.endswith("-es"):
+        return "es"
+    return ((cfg.get("page") or {}).get("language")
+            or (cfg.get("source") or {}).get("language") or "es")
+
+
+def feed_meta(cfg, f):
+    """One feed as data, not as a card: the same facts, for machines.
+
+    The site describes 14 feeds in prose; a directory, a blog, a bot or another
+    client cannot read prose. This is the shape they can read, and it is generated
+    from the same config the pages are, so it cannot drift from them.
+    """
+    rkey = f["rkey"]
+    did = cfg.get("publisher_did") or ""
+    return {
+        "rkey": rkey,
+        "name": f.get("display_name") or rkey,
+        "description": f.get("description") or "",
+        "url": feed_open_url(cfg, rkey),
+        "feed_uri": f"at://{did}/app.bsky.feed.generator/{rkey}",
+        "language": feed_language(cfg, f),
+        "window_hours": f.get("max_age_hours"),
+        "min_likes": f.get("min_likes", 0),
+        "ranking": f.get("ranking", "flat"),
+        "personalized": "foryou" in rkey or bool(f.get("personalized")),
+    }
+
+
+def board_top(rkey, limit=5, texts=True):
+    """The board's current leaders, for a feed card or a JSON consumer.
+
+    Read from CACHE (what is being served right now), never recomputed: a listing
+    that disagrees with the feed it describes is worse than no listing.
+    """
+    picks = list((CACHE.get("feeds") or {}).get(rkey) or [])
+    if not picks:
+        return []
+    scores = (CACHE.get("feed_scores") or {}).get(rkey) or {}
+    picks.sort(key=lambda u: -(scores.get(u) or 0))
+    picks = picks[:limit]
+    out = []
+    if texts:
+        ph = ",".join("?" * len(picks))
+        try:
+            rows = db().execute(
+                f"SELECT uri, author_handle, like_count, repost_count, text "
+                f"FROM posts WHERE uri IN ({ph})", picks).fetchall()
+        except sqlite3.Error:
+            rows = []
+        by_uri = {r[0]: r for r in rows}
+        for uri in picks:
+            row = by_uri.get(uri)
+            if not row:
+                continue
+            out.append({
+                "uri": uri, "author": row[1], "likes": row[2], "reposts": row[3],
+                "text": (row[4] or "")[:280],
+                "url": "https://bsky.app/profile/%s/post/%s"
+                       % (row[1] or uri.split("/")[2], uri.rsplit("/", 1)[-1]),
+                "score": round(float(scores.get(uri) or 0), 4),
+            })
+    return out
+
+
+def feeds_payload(cfg, with_top=0):
+    """`/feeds.json`: every feed this deployment serves, as data."""
+    feeds = list(cfg.get("feeds") or [])
+    out = {
+        "service": cfg.get("hostname"),
+        "did": cfg.get("publisher_did"),
+        "description": ((cfg.get("page") or {}) .get("lede") or "").strip(),
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "count": len(feeds),
+        "feeds": [feed_meta(cfg, f) for f in feeds],
+    }
+    for f, meta in zip(feeds, out["feeds"]):
+        meta["board_size"] = len((CACHE.get("feeds") or {}).get(f["rkey"]) or [])
+        if with_top:
+            meta["top"] = board_top(f["rkey"], with_top)
+    return out
+
+
+def feeds_opml(cfg):
+    """`/feeds.opml`: the same list as a link bundle.
+
+    OPML is an RSS-reader format, and a Bluesky feed is not an RSS feed — subscribing
+    to one in a reader would not deliver posts. It is emitted as a `type="link"`
+    bundle because that is what other tools can actually import: an outline tree of
+    named links to feed pages. Saying so in the file is cheaper than a footnote
+    explaining the confusion later.
+    """
+    e = html.escape
+    feeds = list(cfg.get("feeds") or [])
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<opml version="2.0">',
+        "  <head>",
+        f"    <title>{e((cfg.get('svc_tag') or 'feeds'))} — Bluesky feeds</title>",
+        f"    <dateCreated>{datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')}</dateCreated>",
+        f"    <ownerName>{e(((cfg.get('owner') or {}).get('handle') or ''))}</ownerName>",
+        "    <expansionState></expansionState>",
+        "    <!-- Bluesky custom feeds, as a link bundle: type=\"link\", not RSS. -->",
+        "  </head>",
+        "  <body>",
+        f'    <outline text="{e(cfg.get("hostname") or "feeds")}" title="{e(cfg.get("hostname") or "feeds")}">',
+    ]
+    for f in feeds:
+        meta = feed_meta(cfg, f)
+        lines.append(
+            f'      <outline type="link" text="{e(meta["name"])}" '
+            f'title="{e(meta["name"])}" url="{e(meta["url"])}" '
+            f'description="{e(meta["description"])}" '
+            f'category="{e(meta["language"])}" />')
+    lines += ["    </outline>", "  </body>", "</opml>"]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def render_index_page(cfg):
     """The public page at "/": what this deployment serves, and what each feed is for."""
     e = html.escape
@@ -5353,6 +5481,26 @@ class Handler(BaseHTTPRequestHandler):
                     blocked=set(CFG.get("blocked_dids") or ()))
             meta_set(ckey, f"{time.time()}|{json.dumps(out)}")
             return self._send(200, out)
+
+        if u.path == "/feeds.json":
+            try:
+                top = int((q.get("top") or ["0"])[0])
+            except ValueError:
+                top = 0
+            return self._send(200, feeds_payload(CFG, max(0, min(5, top))))
+
+        if u.path == "/feeds.opml":
+            return self._send(200, feeds_opml(CFG), "text/x-opml; charset=utf-8")
+
+        if u.path.startswith("/feed/") and u.path.endswith(".json"):
+            rkey = u.path[len("/feed/"):-len(".json")]
+            f = FEEDS_BY_RKEY.get(rkey)
+            if not f:
+                return self._send(404, {"error": "UnknownFeed", "message": rkey})
+            meta = feed_meta(CFG, f)
+            meta["board_size"] = len((CACHE.get("feeds") or {}).get(rkey) or [])
+            meta["top"] = board_top(rkey, 10)
+            return self._send(200, meta)
 
         if u.path in ("/guide", "/guia"):
             return self._send(200, render_guide_page(CFG), "text/html")
