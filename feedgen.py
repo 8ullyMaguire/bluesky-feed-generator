@@ -337,12 +337,22 @@ CACHE: dict = {
 CACHE_LOCK = threading.Lock()
 DB_LOCK = threading.Lock()
 
-_db_con = None
+_LOCAL = threading.local()
+_QUIZ_CACHE = {}
 
 
 # --------------------------------------------------------------------------
 # storage
 # --------------------------------------------------------------------------
+
+SUGGEST_BAR = [
+    "Público: la cuenta postea de forma pública y no está protegida.",
+    "Propio: al menos diez posts originales en los últimos catorce días; los reposts no cuentan.",
+    "Político o periodístico: el contenido encaja con lo que esta lista ya cubre.",
+    "Sin acoso: ni brigading, ni cuentas que existen para pelear con otras cuentas.",
+    "Sostenible: sigue viva dentro de un mes. Revisamos la lista a mano cada semana.",
+]
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
@@ -546,6 +556,19 @@ CREATE TABLE IF NOT EXISTS visitor_affinity (
 );
 CREATE INDEX IF NOT EXISTS idx_vaff_visitor ON visitor_affinity(visitor_key, score);
 
+-- The quiz, the rising page and the digest all rank by engagement; without this
+-- the quiz does a full scan of every post and took 36 s to answer.
+CREATE INDEX IF NOT EXISTS idx_posts_engagement ON posts((like_count + 3 * repost_count));
+CREATE TABLE IF NOT EXISTS suggestions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    at         REAL NOT NULL,
+    handle     TEXT NOT NULL,
+    reason     TEXT NOT NULL DEFAULT '',
+    lang       TEXT DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'pending',
+    visitor    TEXT,
+    UNIQUE (handle)
+);
 CREATE TABLE IF NOT EXISTS visitor_negative_terms (
     visitor_key   TEXT NOT NULL,
     term          TEXT NOT NULL,
@@ -600,15 +623,24 @@ CREATE TABLE IF NOT EXISTS metrics_log (
 
 
 def db():
-    global _db_con
-    if _db_con is None:
-        con = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None, check_same_thread=False)
+    """One connection per thread.
+
+    This used to be a single shared connection with check_same_thread=False, which
+    worked only because almost everything ran on one thread. The moment a background
+    thread queries at the same time as a request, SQLite raises "another row
+    available" or "database is locked" at whichever caller loses the race — a write
+    from a stranger's suggestion form failed that way. WAL makes separate connections
+    the cheap, correct option.
+    """
+    con = getattr(_LOCAL, "con", None)
+    if con is None:
+        con = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA synchronous=NORMAL")
         con.execute("PRAGMA busy_timeout=30000")
         con.executescript(SCHEMA)
-        _db_con = con
-    return _db_con
+        _LOCAL.con = con
+    return con
 
 
 def migrate_schema():
@@ -4236,6 +4268,9 @@ def quiz_posts(limit=None):
     evenly across that ranking so the sample is not all one author.
     """
     n = int(limit or QUIZ_POSTS)
+    cached = _QUIZ_CACHE.get("picks")
+    if cached and len(cached) >= n and time.time() - _QUIZ_CACHE.get("at", 0) < 3600:
+        return cached[:n]
     rows = db().execute(
         "SELECT uri, author_handle, text, like_count FROM posts "
         "WHERE text IS NOT NULL AND text != '' AND author_did != ? "
@@ -4245,8 +4280,12 @@ def quiz_posts(limit=None):
         return []
     step = max(1, len(rows) // n)
     picks = [rows[i] for i in range(0, len(rows), step)][:n]
-    return [{"uri": r[0], "handle": r[1] or "cuenta", "text": (r[2] or "")[:220],
-             "likes": r[3] or 0} for r in picks]
+    out = [{"uri": r[0], "handle": r[1] or "cuenta", "text": (r[2] or "")[:220],
+            "likes": r[3] or 0} for r in picks]
+    # Deterministic on the corpus, so an hour of reuse changes nothing a visitor
+    # can see, and saves a query that used to take half a minute.
+    _QUIZ_CACHE.update({"at": time.time(), "picks": out})
+    return out
 
 
 def render_quiz_page(cfg):
@@ -4754,6 +4793,158 @@ def board_top(rkey, limit=5, texts=True):
     return out
 
 
+_RISING = {"lock": threading.Lock(), "data": {}, "computing": set()}
+
+
+def compute_rising(cfg, window_hours=168, min_span_hours=48, limit=40):
+    """What gained the most engagement this week, measured from the snapshots we keep.
+
+    Nothing else on the site carries a number that exists nowhere else. `/feeds.json`
+    describes the feeds; this describes what actually moved. It is the page a person
+    links to when they want to show that a post broke out, which is the only kind of
+    traffic a feed project can earn instead of asking for.
+
+    Two honesty rules, both structural:
+      * a post only counts if it was first snapshotted at least `min_span_hours` ago,
+        otherwise a post seen twice in ten minutes tops the list with whatever it
+        collected in the first ten minutes of its life;
+      * the number is likes gained while we were watching, not the post's total —
+        a post can enter the corpus already popular, and we should not claim credit
+        for that.
+
+    Costly (about 10 s on a 1.5M-row snapshot table), so it runs off the request path:
+    a background thread refreshes it, and requests read whatever is cached.
+    """
+    now = time.time()
+    cut = now - window_hours * 3600
+    min_span = now - min_span_hours * 3600
+    sql = """
+        WITH f AS (SELECT uri, MIN(ts) AS mt, MAX(ts) AS xt
+                   FROM engagement_snapshots WHERE ts > ? GROUP BY uri)
+        SELECT f.uri, l.likes - a.likes AS d_likes, l.reposts - a.reposts AS d_reposts,
+               l.likes, l.reposts, l.replies, l.ts
+        FROM f
+        JOIN engagement_snapshots a ON a.uri = f.uri AND a.ts = f.mt
+        JOIN engagement_snapshots l ON l.uri = f.uri AND l.ts = f.xt
+        WHERE f.mt < ? AND f.xt > ? AND (l.likes - a.likes) >= 10
+        ORDER BY d_likes DESC
+        LIMIT 400
+    """
+    # Its own connection, deliberately: the shared one is used by request threads,
+    # and a sixty-second analytical query on it blocks every write behind it.
+    con = None
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+        con.execute("PRAGMA busy_timeout=30000")
+        rows = con.execute(sql, (cut, min_span, now - 86400)).fetchall()
+    except sqlite3.Error as e:
+        print(f"[{SVC_TAG}] rising query failed: {e}", flush=True)
+        rows = []
+
+    posts = []
+    if rows:
+        uris = [r[0] for r in rows]
+        ph = ",".join("?" * len(uris))
+        info = {}
+        try:
+            for row in (con or db()).execute(
+                    f"SELECT uri, author_handle, text FROM posts WHERE uri IN ({ph})",
+                    uris):
+                info[row[0]] = row
+        except sqlite3.Error:
+            info = {}
+        served = {}
+        for rkey, board_uris in (CACHE.get("feeds") or {}).items():
+            for u in board_uris:
+                served.setdefault(u, rkey)
+        for uri, d_likes, d_reposts, likes, reposts, replies, ts in rows:
+            p = info.get(uri)
+            if not p or not p[2]:
+                continue
+            handle = p[1] or uri.split("/")[2]
+            posts.append({
+                "uri": uri,
+                "author": handle,
+                "text": p[2][:280],
+                "likes": likes,
+                "reposts": reposts,
+                "replies": replies,
+                "delta_likes": d_likes,
+                "delta_reposts": d_reposts,
+                "board": served.get(uri),
+                "url": "https://bsky.app/profile/%s/post/%s"
+                       % (handle, uri.rsplit("/", 1)[-1]),
+            })
+
+    authors = {}
+    for p in posts:
+        a = authors.setdefault(p["author"],
+                               {"handle": p["author"], "delta_likes": 0, "posts": 0})
+        a["delta_likes"] += p["delta_likes"]
+        a["posts"] += 1
+    author_list = sorted(authors.values(), key=lambda a: -a["delta_likes"])[:20]
+    for a in author_list:
+        a["url"] = "https://bsky.app/profile/%s" % a["handle"]
+
+    data = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "window_hours": window_hours,
+        "min_span_hours": min_span_hours,
+        "count": len(posts),
+        "posts": posts[:limit],
+        "authors": author_list,
+    }
+    if con is not None:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+    with _RISING["lock"]:
+        _RISING["data"][window_hours] = data
+    return data
+
+
+def rising_payload(cfg, window_hours=168):
+    """Cached rising data; kicks a compute in the background on a cold cache."""
+    with _RISING["lock"]:
+        cached = _RISING["data"].get(window_hours)
+    if cached and (time.time() - _parse_iso(cached["generated_at"])) < 3600:
+        return cached
+    if window_hours not in _RISING["computing"]:
+        _RISING["computing"].add(window_hours)
+
+        def run():
+            try:
+                compute_rising(cfg, window_hours)
+            finally:
+                _RISING["computing"].discard(window_hours)
+
+        threading.Thread(target=run, daemon=True).start()
+    if cached:
+        return cached
+    return {"generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "window_hours": window_hours, "min_span_hours": 48,
+            "status": "computing", "count": 0, "posts": [], "authors": []}
+
+
+def _parse_iso(s):
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def rising_loop():
+    """Keep the rising page warm: the query is too slow for a request thread."""
+    time.sleep(90)
+    while True:
+        try:
+            compute_rising(CFG, 168)
+        except Exception as e:
+            print(f"[{SVC_TAG}] rising refresh failed: {e}", flush=True)
+        time.sleep(CFG.get("rising_refresh_secs", 1800))
+
+
 def feeds_payload(cfg, with_top=0):
     """`/feeds.json`: every feed this deployment serves, as data."""
     feeds = list(cfg.get("feeds") or [])
@@ -4891,7 +5082,51 @@ para ordenar lo que ves, igual que el For You de Bluesky.</p>
     return doc.encode()
 
 
-def render_guide_page(cfg):
+def guide_blocks(section):
+    """One guide section as ordered, typed blocks.
+
+    The HTML renderer walks the fields in a fixed order (p, steps, bullets, code,
+    table); a front end has to do the same, and guessing that order from key names
+    gets it wrong. This is the order, spelled out once, for both renderers.
+    """
+    out = []
+    for p in section.get("p") or []:
+        out.append({"type": "p", "text": p})
+    if section.get("steps"):
+        out.append({"type": "steps", "items": list(section["steps"])})
+    if section.get("bullets"):
+        out.append({"type": "bullets", "items": list(section["bullets"])})
+    if section.get("code"):
+        out.append({"type": "code", "text": section["code"]})
+    if section.get("table"):
+        out.append({"type": "table", "rows": [list(r) for r in section["table"]]})
+    return out
+
+
+def guide_payload(cfg, lang="es"):
+    """The guide with typed blocks, for front ends that do not read HTML."""
+    guide = dict(guide_for(cfg, lang)[0])
+    sections = []
+    for i, s in enumerate(guide.get("sections") or []):
+        sections.append({
+            "id": s.get("id") or f"s{i}",
+            "h": s.get("h") or "",
+            "blocks": guide_blocks(s),
+        })
+    guide["sections"] = sections
+    return guide
+
+
+def guide_for(cfg, lang="es"):
+    """The guide in the requested language, falling back to the configured one."""
+    page = page_cfg(cfg)
+    if lang == "en":
+        g = page.get("guide_en") or page.get("guide") or {}
+        return g, ("en" if page.get("guide_en") else "es")
+    return (page.get("guide") or {}), "es"
+
+
+def render_guide_page(cfg, lang="es"):
     """/guide: the long-form how-to, written for someone who has never run a
     server. Content lives in config (`page.guide`), so each deployment writes it
     in its own language and links its own repository.
@@ -4900,7 +5135,7 @@ def render_guide_page(cfg):
     value is escaped; nothing here is interpolated unescaped into HTML.
     """
     e = html.escape
-    guide = (page_cfg(cfg).get("guide") or {})
+    guide, _lang = guide_for(cfg, lang)
     sections = guide.get("sections") or []
     if not sections:
         return _page("Guide",
@@ -4934,7 +5169,6 @@ def render_guide_page(cfg):
             if guide.get("back") is not None else "")
     body = (back
             + f'<h1>{e(guide.get("title") or "Guide")}</h1>'
-            f'<p class="lede">{e(guide.get("lede") or "")}</p>'
             f'<p class="lede">{e(guide.get("lede") or "")}</p>'
             f'<nav class="toc"><b>{e(guide.get("toc_title") or "Contents")}</b>'
             f'<ol>{"".join(toc)}</ol></nav>'
@@ -5482,12 +5716,52 @@ class Handler(BaseHTTPRequestHandler):
             meta_set(ckey, f"{time.time()}|{json.dumps(out)}")
             return self._send(200, out)
 
+        if u.path == "/site.json":
+            # The page copy (title, lede, FAQ, guide) as data, so a front end can
+            # render it without a second copy to keep in sync. The config stays the
+            # single source; this is the same dict the HTML pages are built from.
+            page = dict(page_cfg(CFG))
+            if page.get("guide"):
+                page["guide"] = guide_payload(CFG, "es")
+            if page.get("guide_en"):
+                page["guide_en"] = guide_payload(CFG, "en")
+            return self._send(200, {
+                "service": CFG.get("hostname"),
+                "did": CFG.get("publisher_did"),
+                "owner": {"handle": ((CFG.get("owner") or {}).get("handle") or ""),
+                          "did": ((CFG.get("owner") or {}).get("did") or "")},
+                "page": page,
+            })
+
         if u.path == "/feeds.json":
             try:
                 top = int((q.get("top") or ["0"])[0])
             except ValueError:
                 top = 0
             return self._send(200, feeds_payload(CFG, max(0, min(5, top))))
+
+        if u.path == "/suggestions.json":
+            try:
+                rows = db().execute(
+                    "SELECT handle, reason, lang, status, at FROM suggestions "
+                    "WHERE status != 'rejected' ORDER BY at DESC LIMIT 200").fetchall()
+            except sqlite3.Error:
+                rows = []
+            return self._send(200, {
+                "count": len(rows),
+                "accepted": [{"handle": r[0], "why": r[1], "lang": r[2]}
+                             for r in rows if r[3] == "accepted"],
+                "pending": len([r for r in rows if r[3] == "pending"]),
+                "bar": SUGGEST_BAR,
+            })
+
+        if u.path == "/rising.json":
+            try:
+                hours = int((q.get("hours") or ["168"])[0])
+            except ValueError:
+                hours = 168
+            hours = max(24, min(168, hours))
+            return self._send(200, rising_payload(CFG, hours))
 
         if u.path == "/feeds.opml":
             return self._send(200, feeds_opml(CFG), "text/x-opml; charset=utf-8")
@@ -5503,7 +5777,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, meta)
 
         if u.path in ("/guide", "/guia"):
-            return self._send(200, render_guide_page(CFG), "text/html")
+            return self._send(200, render_guide_page(
+                CFG, "en" if u.path == "/guide" else "es"), "text/html")
 
         if u.path == "/metrics.json":
             try:
@@ -5599,8 +5874,74 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_submit_taste()
         if u.path == "/xrpc/app.bsky.feed.sendInteractions":
             return self._handle_send_interactions()
+        if u.path == "/suggest":
+            return self._handle_suggest()
         return self._send(404, {"error": "NotFound"})
 
+
+    def _handle_suggest(self):
+        """Public suggestion box: the only inbound channel the list has.
+
+        A stranger can propose an account without an account of their own, so this is
+        bounded like the taste quiz: urlencoded or JSON body, one handle, one short
+        reason, a per-visitor daily limit, and no identifiers beyond the same
+        daily-rotating pseudonym the quiz uses. Nothing here publishes anything; a
+        person reads it and decides, and `/suggestions.json` shows only what was
+        accepted plus how much is waiting.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+        except ValueError:
+            raw = b""
+        if len(raw) > 4000:
+            return self._send(413, {"error": "TooLarge"})
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        if ctype == "application/json":
+            try:
+                data = json.loads(raw or b"{}")
+            except ValueError:
+                return self._send(400, {"error": "BadJson"})
+        else:
+            data = {k: v[0] for k, v in urllib.parse.parse_qs(
+                raw.decode("utf-8", "replace")).items()}
+
+        handle = (data.get("handle") or "").strip().lstrip("@").lower()
+        reason = (data.get("reason") or "").strip()[:600]
+        lang = (data.get("lang") or "")[:5]
+        if not handle or " " in handle or "." not in handle:
+            return self._send(400, {"error": "BadHandle"})
+        if len(reason) < 20:
+            return self._send(400, {"error": "ReasonTooShort",
+                                    "message": "Cuéntanos en una frase por qué encaja."})
+
+        visitor = visitor_key(self.headers)
+        today = int(time.time() // 86400)
+        try:
+            used = db().execute(
+                "SELECT COUNT(*) FROM suggestions WHERE at > ? AND visitor = ?",
+                (today * 86400, visitor)).fetchone()[0]
+        except sqlite3.Error:
+            used = 0
+        if used >= 3:
+            return self._send(429, {"error": "RateLimited"})
+
+        try:
+            db().execute(
+                "INSERT INTO suggestions (at, handle, reason, lang, status, visitor) "
+                "VALUES (?,?,?,?, 'pending', ?) "
+                "ON CONFLICT(handle) DO UPDATE SET reason=excluded.reason, "
+                "at=excluded.at, lang=excluded.lang, status='pending' "
+                "WHERE suggestions.status = 'pending'",
+                (time.time(), handle, reason, lang, visitor))
+            db().execute(
+                "INSERT INTO actions (kind, created_at, detail) VALUES ('suggest', ?, ?)",
+                (time.time(), visitor))
+        except sqlite3.Error as e:
+            print(f"[{SVC_TAG}] suggest failed: {e}", flush=True)
+            return self._send(500, {"error": "StoreFailed"})
+        print(f"[{SVC_TAG}] suggestion: {handle}", flush=True)
+        return self._send(200, {"ok": True, "handle": handle})
 
     def _handle_submit_taste(self):
         """Taste quiz submission: the only write a stranger can reach without
@@ -5837,6 +6178,7 @@ def main():
     if kw_enabled():
         print(f"[{SVC_TAG}] keyword weights seeded ({kw_init()} new)", flush=True)
     threading.Thread(target=warm_start, daemon=True).start()
+    threading.Thread(target=rising_loop, daemon=True).start()
     print(f"[{SVC_TAG}] listening on 127.0.0.1:{CFG.get('port', 8080)} "
           f"(warming in the background)", flush=True)
     HTTPServer(("127.0.0.1", CFG.get("port", 8080)), Handler).serve_forever()
