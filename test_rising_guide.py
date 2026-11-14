@@ -88,6 +88,31 @@ def test_guide_blocks_follow_the_renderer_order():
     print("guide: block order matches the HTML renderer")
 
 
+def test_english_guide_mirrors_the_spanish_one():
+    """If a deployment ships an English guide, it must cover the same sections.
+
+    A half-translated guide is worse than none: the reader follows the table of contents
+    into a section that does not exist. Structure is compared, not wording.
+    """
+    page = fg.page_cfg(fg.CFG)
+    es = page.get("guide") or {}
+    en = page.get("guide_en")
+    if not en:
+        print("english guide: not configured here, nothing to compare")
+        return
+    es_ids = [s.get("id") for s in es.get("sections") or []]
+    en_ids = [s.get("id") for s in en.get("sections") or []]
+    assert en_ids == es_ids, (en_ids, es_ids)
+    for s_es, s_en in zip(es.get("sections") or [], en.get("sections") or []):
+        for key in ("p", "steps", "bullets"):
+            assert len(s_en.get(key) or []) == len(s_es.get(key) or []), \
+                f"{s_es.get('id')}: {key} count differs"
+        assert bool(s_en.get("code")) == bool(s_es.get("code")), s_es.get("id")
+        assert len(s_en.get("table") or []) == len(s_es.get("table") or []), \
+            f"{s_es.get('id')}: table rows differ"
+    print(f"english guide mirrors all {len(en_ids)} sections")
+
+
 def test_suggestion_bar_is_stated():
     assert len(fg.SUGGEST_BAR) >= 4
     assert all(len(line) > 20 for line in fg.SUGGEST_BAR)
@@ -98,5 +123,6 @@ if __name__ == "__main__":
     test_rising_counts_growth_and_ignores_the_young()
     test_rising_is_empty_rather_than_wrong()
     test_guide_blocks_follow_the_renderer_order()
+    test_english_guide_mirrors_the_spanish_one()
     test_suggestion_bar_is_stated()
     print("ALL RISING/GUIDE CHECKS PASSED")
