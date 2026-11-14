@@ -33,7 +33,11 @@ def test_structure_renders():
     assert '<section id="a">' in doc and '<section id="b">' in doc
     assert '<ol class="steps">' in doc and "<li>one</li>" in doc, "steps missing"
     assert "<table>" in doc and "<td>key</td>" in doc, "table missing"
-    assert "<pre><code>echo &#x27;&lt;hi&gt;&#x27;</code></pre>" in doc, "code block missing"
+    # Assert the escaped code inside a pre/code pair, not the exact opening tag: the
+    # highlighter started emitting `<pre tabindex="0">` and the old literal made a
+    # correct render look broken.
+    assert "<pre" in doc and "<code>echo &#x27;&lt;hi&gt;&#x27;</code></pre>" in doc, \
+        "code block missing"
     print("structure ok")
 
 
