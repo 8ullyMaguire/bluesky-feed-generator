@@ -4155,6 +4155,7 @@ a.gh .star { font-size: 1.05em; }
 PAGE_CSS2 = """
 table{max-width:100%;border-collapse:collapse;font-size:.85em}
 th,td{padding:2px 4px;overflow-wrap:anywhere}
+.tscroll{overflow-x:auto;max-width:100%}
 body { margin: 0; background: #12100e; color: #ece7df;
        font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif; }
 main { max-width: 54rem; margin: 0 auto; padding: 2rem 1.1rem 4rem; }
@@ -4999,6 +5000,11 @@ def render_status_page(snap, cfg):
     # A fragment is not a page. /status was answering with this body alone, so the browser got no doctype,
     # no lang, no title and no description — measured 2026-11-13 by the estate crawler, which could not read
     # the page's own title because the page had none.
+    # A 17-column table is 500 px wide and a phone is 390: the page scrolled sideways by 128 px (measured
+    # 2026-11-14). Each table gets its own scroll box, focusable, because a scrollable region that a keyboard
+    # cannot reach is a defect of its own.
+    out = re.sub(r"<table", '<div class="tscroll" tabindex="0" role="region" aria-label="tabla">\n<table', out)
+    out = out.replace("</table>", "</table>\n</div>")
     return _page("Estado del servicio", out,
                  "Contadores de la última actualización.",
                  "Estado del servicio: métricas por feed, la tubería de cada uno y los contadores "
