@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -59,7 +60,13 @@ def restart_unit(unit):
 def cycle_age(db, now=None):
     """Seconds since the newest metrics row, or None when there is no history."""
     now = now or time.time()
-    row = db.execute("SELECT MAX(ts) FROM metrics_log").fetchone()
+    try:
+        row = db.execute("SELECT MAX(ts) FROM metrics_log").fetchone()
+    except sqlite3.Error:
+        # A database that has not been migrated yet is not a stale cycle; it is a
+        # different fact, and reporting it as staleness would page about the wrong
+        # thing. The caller treats None as "cannot say".
+        return None
     if not row or row[0] is None:
         return None
     return max(0.0, now - float(row[0]))
@@ -76,10 +83,13 @@ def board_depth(db, cfg, now=None):
         rkey, cap = f.get("rkey"), int(f.get("max_posts") or 0)
         if not rkey or not cap:
             continue
-        row = db.execute(
-            "SELECT COUNT(DISTINCT uri) FROM board_scores "
-            "WHERE feed_rkey=? AND ts=(SELECT MAX(ts) FROM board_scores "
-            "                          WHERE feed_rkey=?)", (rkey, rkey)).fetchone()
+        try:
+            row = db.execute(
+                "SELECT COUNT(DISTINCT uri) FROM board_scores "
+                "WHERE feed_rkey=? AND ts=(SELECT MAX(ts) FROM board_scores "
+                "                          WHERE feed_rkey=?)", (rkey, rkey)).fetchone()
+        except sqlite3.Error:
+            return {}                 # no board table yet: nothing to judge
         n = int(row[0] or 0)
         # A curated board (the operator's own liked posts, chronological) cannot be
         # filled by ranking: its cap is aspirational. Counting it as a supply fault
@@ -130,7 +140,6 @@ def main():
                     help="do not try notify.py even if a sink is configured")
     args = ap.parse_args()
 
-    import sqlite3
     deploy = args.deploy or os.getcwd()
     state_path = args.state or os.path.join(deploy, "diagnostics", "watchdog.json")
     alerts_path = os.path.join(deploy, "diagnostics", "alerts.jsonl")

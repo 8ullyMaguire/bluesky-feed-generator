@@ -66,4 +66,11 @@ con2.execute("INSERT INTO metrics_log VALUES (?)", (now - 3600,))
 age = wd.cycle_age(con2, now)
 assert age > wd.STALE_CYCLE_SECS, age
 print("ok  an old cycle is visible as staleness (%.0f min)" % (age / 60))
+# A database that has not been migrated (or is brand new) must not crash the watchdog:
+# it means "cannot say", not "stale".
+bare = sqlite3.connect(":memory:")
+bare.execute("CREATE TABLE metrics_log(ts REAL)")
+assert wd.cycle_age(bare, time.time()) is None
+assert wd.board_depth(bare, CFG) == {}
+print("ok  a database without the board table is unknown, not a fault")
 print("ALL WATCHDOG CHECKS PASSED")

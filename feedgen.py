@@ -4203,6 +4203,11 @@ def _page(title, body, note="", desc=""):
     `desc` is required in spirit: every page here used to be published without a
     meta description, which is the one line a search result and a link preview quote."""
     e = html.escape
+    # A <pre> that is wider than the screen scrolls, and a scrollable region a keyboard cannot reach is a defect
+    # axe names (3 nodes at #path-b-install on /guide, measured at 390 px on 2026-11-14). Making every <pre>
+    # focusable is the one-line answer and it costs a tab stop on pages that do not need one, which is cheaper
+    # than a page that cannot be read with a keyboard.
+    body = re.sub(r"<pre(?![^>]*tabindex)", '<pre tabindex="0"', body)
     desc = desc or f"{title} — top-posts feeds de Bluesky, con los criterios a la vista."
     return f"""<!doctype html>
 <html lang="es">
