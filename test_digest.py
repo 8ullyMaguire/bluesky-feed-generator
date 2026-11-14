@@ -57,6 +57,13 @@ problems = dp.check("x" * 301)
 assert problems and "post cap" in problems[0], problems
 print("ok  an over-length digest is flagged")
 
+# An allowlist decides which boards may be digested; a name that matches nothing
+# composes nothing rather than falling back to everything.
+only = dp.compose(CFG, con, only=["f1"])
+assert only and only["feeds"] == ["f1"], only
+assert dp.compose(CFG, con, only=["not-a-board"]) is None
+print("ok  the digest allowlist is respected in both directions")
+
 # An empty estate produces no digest rather than an empty post.
 empty = sqlite3.connect(":memory:")
 empty.execute("CREATE TABLE posts(uri TEXT, author_did TEXT, author_handle TEXT, "
@@ -65,4 +72,37 @@ empty.execute("CREATE TABLE board_scores(ts REAL, feed_rkey TEXT, pos INT, "
               "uri TEXT, score REAL)")
 assert dp.compose(CFG, empty) is None
 print("ok  an empty estate composes nothing")
+# Facet offsets are UTF-8 byte offsets, not character offsets. The digest text has
+# emoji and accents by construction; counting characters puts every link three bytes
+# early and the post renders as text with a broken link in it.
+text = "♥ á https://bsky.app/profile/a.bsky.social/post/x"
+facets = dp.facets_for(text)
+assert len(facets) == 1, facets
+b = text.encode("utf-8")
+i = facets[0]["index"]
+assert b[i["byteStart"]:i["byteEnd"]].decode() == \
+    "https://bsky.app/profile/a.bsky.social/post/x", i
+assert i["byteStart"] == len(text[:text.index("http")].encode()), i
+print("ok  link facets use byte offsets across multibyte text")
+
+# Trailing punctuation belongs to the sentence, not the URL.
+f2 = dp.facets_for("see https://example.com/x).")
+assert f2[0]["features"][0]["uri"] == "https://example.com/x", f2
+print("ok  trailing punctuation is not part of the link")
+
+# The same digest must not go out twice in a week; a different one must.
+import tempfile, time as _t, json as _j
+with tempfile.TemporaryDirectory() as td:
+    st = os.path.join(td, "s.json")
+    assert dp.already_posted(st, "hello") is None
+    with open(st, "w") as fh:
+        _j.dump({"last": {"hash": dp.text_hash("hello"), "ts": _t.time()}}, fh)
+    assert dp.already_posted(st, "hello") is not None
+    assert dp.already_posted(st, "different") is None
+    with open(st, "w") as fh:
+        _j.dump({"last": {"hash": dp.text_hash("hello"),
+                          "ts": _t.time() - 8 * 86400}}, fh)
+    assert dp.already_posted(st, "hello") is None, "an old digest may repeat"
+print("ok  a repeated digest is refused inside the week, allowed after")
+
 print("ALL DIGEST CHECKS PASSED")

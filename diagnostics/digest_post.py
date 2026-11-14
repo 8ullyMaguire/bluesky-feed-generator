@@ -17,15 +17,19 @@ The digest is built from served board state, not from the corpus, so it can only
 ever recommend something a reader could have been shown.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import sys
+import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 GRAPHEME_CAP = 300
-FACET_MENTION = re.compile(r"@([a-z0-9.-]+)")
+PDS = "https://bsky.social"
+URL_RE = re.compile(r"https?://[^\s]+")
 
 
 def con_ro(path):
@@ -70,7 +74,7 @@ def shorten(text, width=110):
     return cut + "…"
 
 
-def compose(cfg, db, since_days=7, top=3, max_boards=3, budget=290):
+def compose(cfg, db, since_days=7, top=3, max_boards=3, budget=290, only=None):
     """Fill a post's character budget with the week's best community posts.
 
     300 graphemes is the hard cap, and a URL costs ~62 of them, so a post can
@@ -82,10 +86,22 @@ def compose(cfg, db, since_days=7, top=3, max_boards=3, budget=290):
     owner = ((cfg.get("owner") or {}).get("did")
              or (cfg.get("source") or {}).get("did"))
 
+    # Not every board belongs in a digest. On the adult deployment, `bnwo-general`
+    # and `bnwo-trending` surfaced mainstream political posts (a Bluesky outage joke,
+    # a trans-rights post) because those boards draw from the wider follow graph; a
+    # digest built from them put labelled-adult framing on posts that are not adult
+    # at all. `digest.feeds` names the boards that represent the deployment.
     pool = []
-    for rkey, n in boards(db, since)[:max_boards]:
+    used_boards = 0
+    wanted = only or ((cfg.get("digest") or {}).get("feeds") or [])
+    for rkey, n in boards(db, since):
+        if wanted and rkey not in wanted:
+            continue
+        if not wanted and used_boards >= max_boards:
+            break
         if n < 20:
             continue                       # a board with no depth is not a digest
+        used_boards += 1
         for row in top_posts(db, rkey, since, top, owner):
             pool.append((rkey, feeds.get(rkey, {}), row))
     if not pool:
@@ -124,6 +140,103 @@ def check(text):
     return problems
 
 
+def load_env(path):
+    """BSKY_HANDLE / BSKY_APP_PASSWORD from a dotfile, never printed."""
+    env = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return env
+
+
+def xrpc(method, payload=None, token=None, host=PDS):
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"{host}/xrpc/{method}", data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def facets_for(text):
+    """Link facets with BYTE offsets.
+
+    The facet index is into the UTF-8 encoding, not into characters. A digest with an
+    emoji or an accent in it (this one has both, by construction) gets every link
+    offset wrong if you count characters — the link lands three bytes early and the
+    post reads as broken rather than as a link.
+    """
+    out = []
+    for m in URL_RE.finditer(text):
+        url = m.group(0).rstrip(".,;:)!?\u2026")
+        start = len(text[:m.start()].encode("utf-8"))
+        end = start + len(url.encode("utf-8"))
+        out.append({"index": {"byteStart": start, "byteEnd": end},
+                    "features": [{"$type": "app.bsky.richtext.facet#link",
+                                  "uri": url}]})
+    return out
+
+
+def text_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def already_posted(state_path, text, days=6.0):
+    """Refuse to post the same digest twice in a week.
+
+    The timer runs weekly, but a failed run gets retried by the next trigger and a
+    manual run can happen any time. Posting the same five links twice is the kind of
+    thing that makes an account look automated.
+    """
+    try:
+        with open(state_path) as fh:
+            state = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    last = state.get("last") or {}
+    if last.get("hash") != text_hash(text):
+        return None
+    age_days = (datetime.now(timezone.utc).timestamp()
+                - float(last.get("ts") or 0)) / 86400.0
+    return last if age_days < days else None
+
+
+def publish(text, env_path, host=PDS, adult=False):
+    env = load_env(env_path)
+    handle, password = env.get("BSKY_HANDLE"), env.get("BSKY_APP_PASSWORD")
+    if not handle or not password:
+        sys.exit(f"no BSKY_HANDLE/BSKY_APP_PASSWORD in {env_path}")
+    sess = xrpc("com.atproto.server.createSession",
+                {"identifier": handle, "password": password}, host=host)
+    record = {
+        "$type": "app.bsky.feed.post",
+        "text": text,
+        "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+        "facets": facets_for(text),
+    }
+    if adult:
+        # Self-labelling is the account's own declaration; a digest of adult posts
+        # should carry it, or the post is a labelled-content leak.
+        record["labels"] = {"$type": "com.atproto.label.defs#selfLabels",
+                            "values": [{"val": "sexual"}]}
+    res = xrpc("com.atproto.repo.createRecord",
+               {"repo": sess["did"], "collection": "app.bsky.feed.post",
+                "record": record}, token=sess["accessJwt"], host=host)
+    rkey = res["uri"].rsplit("/", 1)[-1]
+    who = sess.get("handle") or handle
+    return {"uri": res["uri"], "cid": res.get("cid"),
+            "url": f"https://bsky.app/profile/{who}/post/{rkey}"}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=os.path.expanduser("~/.local/share/feedgen/feedgen.sqlite"))
@@ -131,16 +244,26 @@ def main():
     ap.add_argument("--since-days", type=int, default=7)
     ap.add_argument("--top", type=int, default=3)
     ap.add_argument("--max-boards", type=int, default=3)
+    ap.add_argument("--feeds", default=None,
+                    help="comma-separated board rkeys to digest (default: config digest.feeds)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--publish", action="store_true",
                     help="create the post (needs BSKY_HANDLE / BSKY_APP_PASSWORD)")
-    ap.add_argument("--feed-rkey", default=None,
-                    help="feed to attach to the post as a link card, if any")
+    ap.add_argument("--env", default=None,
+                    help="dotfile with BSKY_HANDLE / BSKY_APP_PASSWORD")
+    ap.add_argument("--state", default=None,
+                    help="file recording the last digest posted")
+    ap.add_argument("--adult", action="store_true",
+                    help="self-label the post sexual")
+    ap.add_argument("--force", action="store_true",
+                    help="post even if the same digest went out this week")
+    ap.add_argument("--host", default=PDS)
     args = ap.parse_args()
 
     cfg = json.load(open(args.config))
     db = con_ro(args.db)
-    digest = compose(cfg, db, args.since_days, args.top, args.max_boards)
+    only = [f.strip() for f in (args.feeds or "").split(",") if f.strip()] or None
+    digest = compose(cfg, db, args.since_days, args.top, args.max_boards, only=only)
     if not digest:
         sys.exit("no board had enough depth to digest")
 
@@ -159,10 +282,28 @@ def main():
 
     if problems:
         sys.exit(1)
-    if args.publish:
-        sys.exit("publish path not enabled yet: it needs a session and the operator's "
-                 "decision on what to say")
+    if not args.publish:
+        return 0
+
+    env_path = args.env or os.path.expanduser("~/.env")
+    state_path = args.state or os.path.join(
+        os.path.dirname(os.path.abspath(args.db)), "digest_state.json")
+    if not args.force:
+        prior = already_posted(state_path, digest["text"])
+        if prior:
+            print(f"already posted this digest at {prior.get('at')} "
+                  f"({prior.get('url')}); --force to repeat")
+            return 0
+    posted = publish(digest["text"], env_path, args.host, args.adult)
+    os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
+    with open(state_path, "w") as fh:
+        json.dump({"last": {"hash": text_hash(digest["text"]), "ts": time.time(),
+                            "at": datetime.now(timezone.utc).isoformat(
+                                timespec="seconds"),
+                            "url": posted["url"]}}, fh, indent=1)
+    print(f"posted: {posted['url']}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
