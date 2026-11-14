@@ -5396,6 +5396,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        # A config edit should take effect on the next request, not on the next
+        # refresh cycle: `systemctl reload` used to look like it did nothing for up
+        # to ten minutes, which is how a changed page.community_feeds stayed absent.
+        try:
+            reload_config_if_changed()
+        except Exception:
+            pass
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
 
